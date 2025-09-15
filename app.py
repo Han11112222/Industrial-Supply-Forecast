@@ -57,11 +57,12 @@ def read_excel_to_long(file) -> pd.DataFrame:
     year_cols = []
     for c in df.columns:
         s = str(c)
-        if pd.notna(pd.to_numeric(pd.Series([s]).str.extract(r"((?:19|20)\d{2})")[0][0], errors="coerce")):
+        # 헤더 안의 4자리 연도 추출
+        y = pd.Series([s]).str.extract(r"((?:19|20)\d{2})")[0][0]
+        if pd.to_numeric(y, errors="coerce") is not None:
             year_cols.append(c)
-
     if not year_cols:
-        # 헤더에서 숫자 4자리가 없으면 모든 숫자형 열을 후보로
+        # 헤더에 연도표기가 없으면 숫자형 열을 후보로
         year_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c != cat_col]
 
     m = df[[cat_col] + year_cols].copy().melt(id_vars=[cat_col], var_name="연도열", value_name="사용량")
@@ -93,7 +94,6 @@ def _cagr_forecast(x_years, y_vals, targets):
 def _holt_forecast(y_vals, last_train_year, targets):
     """Holt로 다년 예측. targets는 오름차순 가정. 실패/비정상 시 OLS로 대체."""
     x_years = list(range(last_train_year - len(y_vals) + 1, last_train_year + 1))
-    # Holt는 미래(step>=1)만 예측 가능하므로, 과거/동년이 섞이면 OLS 대체
     if Holt is None or len(y_vals) < 2 or any(t <= last_train_year for t in targets):
         return _linear_forecast(x_years, y_vals, targets)
     try:
@@ -112,7 +112,6 @@ def fmt_int_with_comma(x):
     except Exception: return x
 
 # ───────────────── 본문 실행 ─────────────────
-# 데이터 미리 읽어 ‘학습연도/예측구간’ 컨트롤을 그릴 수 있게 함
 df_long_for_ui = None
 if up is not None:
     df_long_for_ui = read_excel_to_long(up)
@@ -175,11 +174,9 @@ if run:
     pv = pv_all.reindex(columns=TRAIN_YEARS).fillna(0)
 
     # ── 업종별 다년 예측 ─────────────────────────────────────
-    # 결과 테이블: 실제열 + 각 방법×연도 예측열(예: '선형추세(OLS)(2026)')
     result_df = pv.copy()
     result_df.columns = [f"{c} 실적" for c in result_df.columns]
 
-    # fitted 저장(옵션)
     fit_store = {}  # (industry, method) -> (x_years, fitted_values)
 
     for industry, row in pv.iterrows():
@@ -208,15 +205,15 @@ if run:
     sort_method = methods[0]
     sort_col = f"{sort_method}({FORECAST_YEARS[-1]})"
     if sort_col not in result_df.columns:
-        # 예외적으로 다른 방법의 종료연도 열 사용
         fallback_cols = [c for c in result_df.columns if c.endswith(f"({FORECAST_YEARS[-1]})")]
         sort_col = fallback_cols[0] if fallback_cols else result_df.columns[-1]
 
     final_sorted = result_df.sort_values(by=sort_col, ascending=False)
 
-    # 총합 행 계산(실적 + 모든 예측열)
-    totals = {col: (pv[col.replace(" 실적", "")].sum() if col.endswith("실적") else final_sorted[col].sum())
-              for col in final_sorted.columns}
+    # ── 총합 행 계산(실적/예측 모두) — KeyError 수정 포인트 ──
+    # 각 열을 직접 합산(numeric_only=True)하여 자료형 불일치 문제 제거
+    totals_series = final_sorted.sum(axis=0, numeric_only=True)
+    totals = {col: float(totals_series.get(col, 0.0)) for col in final_sorted.columns}
     total_row = pd.DataFrame([totals], index=["총합"])
     final_sorted_with_total = pd.concat([final_sorted, total_row], axis=0)
 
@@ -235,7 +232,6 @@ if run:
     tot_actual = pv.sum(axis=0).reset_index()
     tot_actual.columns = ["연도", "합계"]
 
-    # 모든 예측 포인트(방법×연도)
     pts_rows = []
     for m in methods:
         for yy in FORECAST_YEARS:
@@ -268,7 +264,6 @@ if run:
     st.markdown("### 상위 10개 업종 — 예측 비교 / 실적 추이")
     top10_inds = final_sorted.head(10).index.tolist()
 
-    # 예측연도 선택(막대 그래프 전환)
     yy_pick = st.radio("막대그래프 기준 예측연도", FORECAST_YEARS, index=len(FORECAST_YEARS)-1, horizontal=True)
 
     method_cols_for_plot = [f"{m}({yy_pick})" for m in methods if f"{m}({yy_pick})" in final_sorted.columns]
@@ -310,7 +305,6 @@ if run:
     out_all = final_sorted_with_total.copy()
     out_all.insert(0, "업종", out_all.index)
 
-    # 파일명에 예측 구간(연) 반영
     fname_suffix = f"{FORECAST_YEARS[0]}-{FORECAST_YEARS[-1]}"
 
     wb = Workbook(); wb.remove(wb.active)
@@ -323,12 +317,14 @@ if run:
     # 각 방법별 시트 (표 + Top20 Bar + Totals Line)
     def _add_method_sheet(method_label: str):
         ws = wb.create_sheet(method_label)
-        # 표 구성: 실적 + 해당 방법의 모든 예측연도 열
+        # 표: 실적 + 해당 방법의 모든 예측연도 열
         dfm = pv.copy(); dfm.columns = [f"{c} 실적" for c in dfm.columns]
         pred_cols = [f"{method_label}({yy})" for yy in FORECAST_YEARS if f"{method_label}({yy})" in final_sorted.columns]
         for col in pred_cols:
             dfm[col] = final_sorted[col]
-        dfm = dfm.sort_values(by=(pred_cols[-1] if pred_cols else dfm.columns[-1]), ascending=False).reset_index().rename(columns={"업종": "업종"})
+        # 업종 열 이름 제대로 복원(중요: rename 대상은 'index')
+        order_col = (pred_cols[-1] if pred_cols else dfm.columns[-1])
+        dfm = dfm.sort_values(by=order_col, ascending=False).reset_index().rename(columns={"index": "업종"})
 
         for r in dataframe_to_rows(dfm, index=False, header=True):
             ws.append(r)
@@ -356,6 +352,13 @@ if run:
         ws.cell(row=1, column=line_anchor_col,     value="연도")
         ws.cell(row=1, column=line_anchor_col + 1, value="총합")
         # 실적 총합
+        for i, y in enumerate(TRAIN_YEARS, start=2):
+            ws.cell(row=i, column=line_anchor_col,     value=y)
+            ws.cell(row=i, column=line_anchor_col + 1, value=float(pv[y.replace(" 실적","")] if isinstance(y,str) else pv[y]).sum() if (y if not isinstance(y,str) else int(y.replace(" 실적",""))) in pv.columns else float(pv[y if not isinstance(y,str) else int(y.replace(" 실적",""))].sum()))
+        # 보다 간단/안전: 직접 합산
+        ws.delete_cols(line_anchor_col, 2)  # 위 줄 보정
+        ws.cell(row=1, column=line_anchor_col,     value="연도")
+        ws.cell(row=1, column=line_anchor_col + 1, value="총합")
         for i, y in enumerate(TRAIN_YEARS, start=2):
             ws.cell(row=i, column=line_anchor_col,     value=y)
             ws.cell(row=i, column=line_anchor_col + 1, value=float(pv[y].sum()))
