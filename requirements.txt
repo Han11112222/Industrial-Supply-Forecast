@@ -1,0 +1,7 @@
+streamlit==1.49.1
+pandas==2.2.2
+numpy==1.26.4
+scipy==1.11.4
+statsmodels==0.14.2
+openpyxl==3.1.5
+altair==5.3.0
