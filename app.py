@@ -1,12 +1,12 @@
-# app.py — 도시가스 산업용 업종별 2026 예측 (Streamlit, 그래프 강화)
+# app.py — 도시가스 산업용 업종별 2026 예측 (그래프/엑셀시트 강화)
 # - 업로드(.xlsx) 또는 리포의 샘플 파일 읽기
 # - 예측 3종: 선형추세(OLS), CAGR, Holt(지수평활)
-# - 업종 표: 2021~2025 실적 + 2026 예측(정수/콤마, 내림차순, 총합 하단)
+# - 업종 표: 정수/콤마, 첫 방법 기준 내림차순, 총합 하단
 # - 그래프:
-#   ① 기본: 연도별 총합 그래프(실적 Area + 2026 포인트/라벨)
-#   ② [상세 그래프 보기] 토글 ON 시:
-#        - 업종별 2026 예측 Top-N 막대그래프(선택한 정렬 기준)
-#        - 업종×연도 히트맵(실적 2021–2025)
+#    ① 기본: 연도별 총합 Area+Line + 2026 포인트(방법별)
+#    ② 토글: 업종별 2026 Top-N 막대 + 업종×연도 히트맵
+# - 엑셀(xlsx) 다운로드:
+#    시트1 '전체' + 시트2~4 각 방법(표 + Top20 막대 + 총합 라인)
 
 from pathlib import Path
 from io import BytesIO
@@ -14,10 +14,16 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# statsmodels (Holt)
 try:
     from statsmodels.tsa.holtwinters import Holt
 except Exception:
     Holt = None
+
+# openpyxl charts
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.chart import BarChart, Reference, LineChart
 
 st.set_page_config(page_title="도시가스 공급량·판매량 예측 (업종별, 2026)", layout="wide")
 st.title("도시가스 공급량·판매량 예측 (업종별, 2026)")
@@ -144,15 +150,14 @@ if df_long is not None:
     final_numeric = final_numeric.join(wide)
 
     # 정렬 기준 열(사용자가 고른 첫 방법; Holt 대체 명칭도 지원)
-    first_method = []
-    if "선형추세(OLS)" in wide.columns: first_method.append("선형추세(OLS)")
-    if "CAGR" in wide.columns: first_method.append("CAGR")
     holt_col = next((c for c in wide.columns if c.startswith("Holt")), None)
-    if holt_col: first_method.append(holt_col)
-    # 사용자가 선택한 첫 메서드 우선
-    cand = [m for m in methods if m in first_method or (m=="Holt(지수평활)" and holt_col)]
-    sort_col = cand[0] if cand else (holt_col or first_method[0])
-    if sort_col == "Holt(지수평활)": sort_col = holt_col  # 실제 열명으로 교체
+    sort_pref = []
+    if "선형추세(OLS)" in wide.columns: sort_pref.append("선형추세(OLS)")
+    if "CAGR" in wide.columns:          sort_pref.append("CAGR")
+    if holt_col:                         sort_pref.append(holt_col)
+    cand = [m for m in methods if m in sort_pref or (m == "Holt(지수평활)" and holt_col)]
+    sort_col = cand[0] if cand else (holt_col or sort_pref[0])
+    if sort_col == "Holt(지수평활)": sort_col = holt_col
 
     final_sorted = final_numeric.sort_values(by=sort_col, ascending=False)
 
@@ -175,19 +180,23 @@ if df_long is not None:
     import altair as alt
 
     st.subheader("연도별 총합 그래프 (실적 + 2026 예측 포인트)")
-    # 총합 Area + Line
     tot_actual = pv.sum(axis=0).reset_index()
     tot_actual.columns = ["연도", "합계"]
+
     area = alt.Chart(tot_actual).mark_area(opacity=0.25).encode(
         x=alt.X("연도:O", title="연도"),
         y=alt.Y("합계:Q", title="총합(실적)", axis=alt.Axis(format=",")),
         tooltip=[alt.Tooltip("연도:O"), alt.Tooltip("합계:Q", format=",")]
     )
-    line = alt.Chart(tot_actual).mark_line(size=3).encode(x="연도:O", y=alt.Y("합계:Q", axis=alt.Axis(format=",")))
-    pts = alt.Chart(
-        pd.DataFrame({"연도":[TARGET_YEAR], "방법": list(wide.columns),
-                      "값":[wide[c].sum() for c in wide.columns]})
-    ).mark_point(size=120, filled=True).encode(
+    line = alt.Chart(tot_actual).mark_line(size=3).encode(
+        x="연도:O", y=alt.Y("합계:Q", axis=alt.Axis(format=","))
+    )
+    # (버그 수정) 연도 길이를 방법 수만큼 반복
+    methods_cols = list(wide.columns)
+    pt_vals = [wide[c].sum() for c in methods_cols]
+    pts_df = pd.DataFrame({"연도": [TARGET_YEAR] * len(methods_cols),
+                           "방법": methods_cols, "값": pt_vals})
+    pts = alt.Chart(pts_df).mark_point(size=120, filled=True).encode(
         x="연도:O", y=alt.Y("값:Q", axis=alt.Axis(format=",")),
         color="방법:N",
         tooltip=[alt.Tooltip("방법:N"), alt.Tooltip("값:Q", format=",")]
@@ -196,13 +205,12 @@ if df_long is not None:
 
     st.altair_chart(area + line + pts + labels, use_container_width=True, theme="streamlit")
 
-    # ── 상세 그래프 토글 ──
+    # 상세 그래프 토글
     show_details = st.toggle("상세 그래프 보기 (업종별 실적/예측 한눈에)", value=False)
-
     if show_details:
         st.markdown("### 업종별 2026 예측 Top-N (정렬 기준: **{}**)".format(sort_col))
         topN = st.slider("Top-N", min_value=5, max_value=min(50, len(final_sorted)), value=min(15, len(final_sorted)))
-        bars_df = final_sorted[ [sort_col] ].head(topN).reset_index().rename(columns={sort_col:"예측"})
+        bars_df = final_sorted[[sort_col]].head(topN).reset_index().rename(columns={sort_col: "예측"})
         bars = alt.Chart(bars_df).mark_bar().encode(
             y=alt.Y("업종:N", sort="-x", title=None),
             x=alt.X("예측:Q", axis=alt.Axis(format=","), title="2026 예측"),
@@ -223,20 +231,104 @@ if df_long is not None:
         )
         st.altair_chart(heat, use_container_width=True, theme="streamlit")
 
-    # ───────────────── 다운로드 ─────────────────
+    # ───────────────── 다운로드 (다중 시트 + 차트 포함) ─────────────────
     st.subheader("다운로드")
-    out_for_download = final_sorted_with_total.copy()
-    out_for_download.insert(0, "업종", out_for_download.index)
-    st.download_button(
-        "업종별 예측표 CSV 다운로드",
-        out_for_download.to_csv(index=False).encode("utf-8-sig"),
-        file_name="industry_forecast_2026.csv", mime="text/csv"
-    )
+
+    # 숫자형 원본(총합 포함)
+    out_all = final_sorted_with_total.copy()
+    out_all.insert(0, "업종", out_all.index)
+
+    # 엑셀 작성
+    wb = Workbook()
+    # 기본 시트 제거
+    wb.remove(wb.active)
+
+    # 시트 1: 전체
+    ws_all = wb.create_sheet("전체")
+    for r in dataframe_to_rows(out_all, index=False, header=True):
+        ws_all.append(r)
+
+    # 각 방법별 시트 만들기 (표 + Top20 Bar + Totals Line)
+    def _add_method_sheet(method_label: str, pred_col_name: str):
+        ws = wb.create_sheet(method_label)
+
+        # 표 데이터: 업종 × (2021~2025 실적) + 2026 예측(해당 방법)
+        dfm = pv.copy()
+        dfm.columns = [f"{c} 실적" for c in dfm.columns]
+        if pred_col_name not in wide.columns:
+            # Holt가 'Holt(지수평활,대체:선형)' 등으로 저장됐을 수 있음
+            holt_real = next((c for c in wide.columns if c.startswith("Holt")), None)
+            use_col = holt_real if holt_real else pred_col_name
+        else:
+            use_col = pred_col_name
+
+        dfm[use_col] = wide[use_col]
+        dfm = dfm.sort_values(by=use_col, ascending=False)
+        dfm = dfm.reset_index().rename(columns={"업종": "업종"})
+
+        for r in dataframe_to_rows(dfm, index=False, header=True):
+            ws.append(r)
+
+        # Top20 테이블(오른쪽에 배치) + 막대그래프
+        topN = min(20, len(dfm))
+        start_col = dfm.shape[1] + 2  # 본표 오른쪽 두 칸 띄우기
+        top_start_col_letter = ws.cell(row=1, column=start_col).column_letter
+
+        ws.cell(row=1, column=start_col, value="업종")
+        ws.cell(row=1, column=start_col + 1, value="2026 예측")
+        for i in range(topN):
+            ws.cell(row=i + 2, column=start_col, value=dfm.loc[i, "업종"])
+            ws.cell(row=i + 2, column=start_col + 1, value=float(dfm.loc[i, use_col] or 0))
+
+        bar = BarChart()
+        bar.title = "Top-20 2026 예측"
+        data = Reference(ws, min_col=start_col + 1, min_row=1, max_row=topN + 1)
+        cats = Reference(ws, min_col=start_col, min_row=2, max_row=topN + 1)
+        bar.add_data(data, titles_from_data=True)
+        bar.set_categories(cats)
+        bar.y_axis.title = "예측"
+        bar.y_axis.number_format = '#,##0'
+        ws.add_chart(bar, ws.cell(row=2, column=start_col + 3).coordinate)
+
+        # 연도별 총합 테이블 + 라인그래프
+        line_anchor_col = start_col + 6
+        ws.cell(row=1, column=line_anchor_col, value="연도")
+        ws.cell(row=1, column=line_anchor_col + 1, value="총합")
+        # 2021~2025 실적 총합
+        for i, y in enumerate(YEARS, start=2):
+            ws.cell(row=i, column=line_anchor_col, value=y)
+            ws.cell(row=i, column=line_anchor_col + 1, value=float(pv[y].sum()))
+        # 2026 예측 총합
+        ws.cell(row=len(YEARS) + 2, column=line_anchor_col, value=TARGET_YEAR)
+        ws.cell(row=len(YEARS) + 2, column=line_anchor_col + 1, value=float(wide[use_col].sum()))
+
+        line = LineChart()
+        line.title = "연도별 총합(실적 + 2026 예측)"
+        data2 = Reference(ws, min_col=line_anchor_col + 1, min_row=1, max_row=len(YEARS) + 2)
+        cats2 = Reference(ws, min_col=line_anchor_col, min_row=2, max_row=len(YEARS) + 2)
+        line.add_data(data2, titles_from_data=True)
+        line.set_categories(cats2)
+        line.y_axis.number_format = '#,##0'
+        ws.add_chart(line, ws.cell(row=2, column=line_anchor_col + 3).coordinate)
+
+    # 방법별 시트 추가
+    _add_method_sheet("선형추세(OLS)", "선형추세(OLS)")
+    _add_method_sheet("CAGR", "CAGR")
+    _add_method_sheet("Holt(지수평활)", holt_col if holt_col else "Holt(지수평활)")
+
+    # 바이트로 저장 후 다운로드
     bio = BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        out_for_download.to_excel(writer, index=False, sheet_name="업종별예측")
-    st.download_button("엑셀(xlsx) 다운로드", bio.getvalue(),
+    wb.save(bio)
+    st.download_button("엑셀(xlsx) 다운로드 (다중 시트+차트 포함)", bio.getvalue(),
                        file_name="industry_forecast_2026.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # CSV도 제공(전체 시트 기준)
+    st.download_button(
+        "업종별 예측표 CSV 다운로드",
+        out_all.to_csv(index=False).encode("utf-8-sig"),
+        file_name="industry_forecast_2026.csv", mime="text/csv"
+    )
+
 else:
     st.info("왼쪽에서 엑셀 업로드하거나 ‘샘플 파일 사용’을 체크한 뒤 [예측 시작]을 눌러주세요.")
