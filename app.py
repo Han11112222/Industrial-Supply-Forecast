@@ -1,7 +1,7 @@
 # app.py — 산업용 공급량 예측(추세분석)
 # • 좌측: 학습 연도(멀티), 예측 구간(시작연~종료연, 월 제외)
-# • 예측: OLS / CAGR / Holt(지수평활) — 다년 예측
-# • 결과 유지: 예측 시작 후 session_state에 고정 → 라디오 변경 시 화면 유지
+# • 예측: OLS / CAGR / Holt / SES — 다년 예측
+# • 결과 유지: 예측 시작 후 session_state에 저장 → 라디오 변경에도 유지
 # • 그래프: 총합(실적+예측포인트), Top-10 막대(연도 선택), Top-10 실적추이(예측연도까지 연장)
 # • 다운로드: 전체표 + 방법별 시트(Top-20 막대, 연도별 총합 라인)
 
@@ -13,13 +13,14 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
-# Holt
+# statsmodels (Holt, SES)
 try:
-    from statsmodels.tsa.holtwinters import Holt
+    from statsmodels.tsa.holtwinters import Holt, SimpleExpSmoothing
 except Exception:
     Holt = None
+    SimpleExpSmoothing = None
 
-# openpyxl
+# openpyxl (엑셀 차트)
 from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.chart import BarChart, Reference, LineChart
@@ -27,16 +28,22 @@ from openpyxl.chart import BarChart, Reference, LineChart
 # ───────────────────────── 기본 UI ─────────────────────────
 st.set_page_config(page_title="산업용 공급량 예측(추세분석)", layout="wide")
 st.title("🏭📈 산업용 공급량 예측(추세분석)")
-st.caption("RAW 엑셀 업로드 → 학습연도 선택 → 추세 예측(3종) → 정렬/총합/그래프/다운로드")
+st.caption("RAW 엑셀 업로드 → 학습연도 선택 → 추세 예측(4종) → 정렬/총합/그래프/다운로드")
 
-# 쉬운 요약(툴팁식)
-with st.expander("📚 예측 방법 설명(쉽게 보기)", expanded=False):
-    st.markdown(
-        "- **선형추세(OLS)**: 해마다 얼마나 늘었는지 ‘직선’으로 맞춰서 앞으로를 그려본다.\n"
-        "- **CAGR**: 시작~끝 사이의 연평균 복리성장률로 앞으로를 늘린다(중장기 성장 가정).\n"
-        "- **Holt(지수평활)**: 최근 흐름(수준+추세)을 더 반영해 부드럽게 연장한다(계절성 제외).\n"
-        "→ 서로 다른 가정이니 **비교해서** 쓰면 안전해."
-    )
+# 방법 설명(쉬운 설명 + 산식)
+st.markdown(
+    """
+### 📘 예측 방법 설명
+- **선형추세(OLS)** *(Ordinary Least Squares)* — 해마다 늘어나는 폭을 직선으로 잡아 앞으로 그린다.  
+  산식: 직선 `y_t = a + b t`, 예측 `ŷ_{T+h} = a + b (T+h)`
+- **CAGR(복리성장)** *(Compound Annual Growth Rate)* — 시작~끝 사이의 평균 복리 성장률로 늘린다.  
+  산식: `g = (y_T / y_0)^{1/n} - 1`, 예측 `ŷ_{T+h} = y_T (1+g)^h`
+- **Holt(지수평활·추세형)** — 수준 `l_t`와 추세 `b_t`를 지수 가중으로 갱신해 최근 흐름을 더 반영한다(계절성 제외).  
+  산식(개략): `l_t = α y_t + (1-α)(l_{t-1}+b_{t-1})`, `b_t = β(l_t - l_{t-1}) + (1-β)b_{t-1}`, 예측 `ŷ_{T+h} = l_T + h b_T`
+- **지수평활(SES)** *(Simple Exponential Smoothing, 신규 추가)* — 최근 관측치를 더 크게 반영한 평균으로 미래를 예측한다(추세·계절성 제외).  
+  산식: `l_t = α y_t + (1-α) l_{t-1}`, 예측 `ŷ_{T+h} = l_T`
+"""
+)
 
 # ───────────────────────── 사이드바 ─────────────────────────
 with st.sidebar:
@@ -47,7 +54,7 @@ with st.sidebar:
 
     st.divider()
     st.header("🧪 ② 예측 방법")
-    METHOD_CHOICES = ["선형추세(OLS)", "CAGR", "Holt(지수평활)"]
+    METHOD_CHOICES = ["선형추세(OLS)", "CAGR(복리성장)", "Holt(지수평활)", "지수평활(SES)"]
     methods = st.multiselect("방법 선택(정렬 기준은 첫 번째)", METHOD_CHOICES, default=METHOD_CHOICES)
 
 # ───────────────────────── 유틸 ─────────────────────────
@@ -100,6 +107,16 @@ def _holt(y_vals, last_train_year, targets):
     preds = [float(fc[h - 1]) for h in [t - last_train_year for t in targets]]
     return preds, np.array(fit.fittedvalues, dtype=float)
 
+def _ses(y_vals, last_train_year, targets):
+    x_years = list(range(last_train_year - len(y_vals) + 1, last_train_year + 1))
+    if SimpleExpSmoothing is None or len(y_vals) < 2 or any(t <= last_train_year for t in targets):
+        return _ols(x_years, y_vals, targets)
+    fit = SimpleExpSmoothing(np.asarray(y_vals)).fit(optimized=True)
+    max_h = max(t - last_train_year for t in targets)
+    fc = fit.forecast(max_h)
+    preds = [float(fc[h - 1]) for h in [t - last_train_year for t in targets]]
+    return preds, np.array(fit.fittedvalues, dtype=float)
+
 def fmt_int(x):
     if pd.isna(x): return ""
     try: return f"{int(round(float(x))):,}"
@@ -132,17 +149,11 @@ if df_long_ui is not None:
         FORECAST_YEARS = list(range(min(start_y, end_y), max(start_y, end_y) + 1))
 
         st.divider()
-        c1, c2 = st.columns(2)
-        with c1:
-            run_clicked = st.button("🚀 예측 시작", use_container_width=True)
-        with c2:
-            reset_clicked = st.button("🔄 다시 계산", use_container_width=True)
-
+        run_clicked = st.button("🚀 예측 시작", use_container_width=True)
 else:
     st.info("좌측에서 엑셀을 업로드하거나 ‘Repo 파일 사용’을 체크해줘.")
 
 # ───────────────────────── 상태 유지(세션) ─────────────────────────
-# 세션 초기화
 if "started" not in st.session_state:
     st.session_state.started = False
 if "store" not in st.session_state:
@@ -166,14 +177,22 @@ def compute_and_store():
         x = TRAIN_YEARS
         last = x[-1]
         for m in methods:
-            if m == "선형추세(OLS)":
+            label = str(m)
+            if "OLS" in label:
                 preds, _ = _ols(x, y, FORECAST_YEARS)
-            elif m == "CAGR":
+            elif "CAGR" in label:
                 preds, _ = _cagr(x, y, FORECAST_YEARS)
-            else:
+            elif "Holt" in label:
                 preds, _ = _holt(y, last, FORECAST_YEARS)
+            elif "SES" in label:
+                preds, _ = _ses(y, last, FORECAST_YEARS)
+            else:
+                preds, _ = _ols(x, y, FORECAST_YEARS)
+
             for yy, p in zip(FORECAST_YEARS, preds):
-                col = f"{m}({yy})"
+                col = f"{label}({yy})" if "(" not in label.split()[-1] else f"{label}"
+                # 위 라인은 label 자체가 이미 (연도)형이 아닌 일반 라벨인 것을 가정
+                col = f"{label}({yy})"
                 if col not in result.columns: result[col] = np.nan
                 result.loc[ind, col] = p
 
@@ -189,17 +208,13 @@ def compute_and_store():
     total_row = pd.DataFrame([totals.to_dict()], index=["총합"])
     final_with_total = pd.concat([final_sorted, total_row], axis=0)
 
-    # 저장
     st.session_state.store = dict(
         pv=pv, final=final_sorted, final_total=final_with_total,
         train_years=TRAIN_YEARS, fc_years=FORECAST_YEARS, methods=methods
     )
     st.session_state.started = True
 
-# 트리거
 if run_clicked and df_long_ui is not None and methods and TRAIN_YEARS and FORECAST_YEARS:
-    compute_and_store()
-elif reset_clicked and st.session_state.started:
     compute_and_store()
 
 # ───────────────────────── 결과 표시 ─────────────────────────
@@ -254,7 +269,6 @@ if st.session_state.started:
     st.subheader("🏆 상위 10개 업종 — 예측 비교 / 실적 추이")
     yy_pick = st.radio("막대그래프 기준 예측연도", FORECAST_YEARS, index=len(FORECAST_YEARS)-1, horizontal=True, key="yy_pick")
 
-    # 막대(연도별 방법 비교)
     method_cols = [f"{m}({yy_pick})" for m in methods if f"{m}({yy_pick})" in final_sorted.columns]
     if method_cols:
         top10 = final_sorted.head(10).index.tolist()
@@ -274,7 +288,7 @@ if st.session_state.started:
         ).add_params(sel).properties(height=420)
         bar_txt = bars.mark_text(dy=-5, fontSize=10).encode(text=alt.Text("예측:Q", format=","))
 
-        # 라인(실적 + 선택방법 예측연장)
+        # 라인(실적 + 선택방법 예측연장: 첫 번째 방법)
         st.markdown("※ 라인 그래프는 **첫 번째로 선택한 방법**으로 2026·2027을 이어서 보여줘.")
         method_for_line = methods[0]
         pred_cols_for_line = [f"{method_for_line}({yy})" for yy in FORECAST_YEARS if f"{method_for_line}({yy})" in final_sorted.columns]
@@ -285,15 +299,13 @@ if st.session_state.started:
         pred_line = pd.DataFrame()
         if pred_cols_for_line:
             pred_line = final_sorted.loc[top10, pred_cols_for_line].copy()
-            # 열명에서 연도 뽑기
             pred_line.columns = [int(re.search(r"\((\d{4})\)", c).group(1)) for c in pred_line.columns]
             pred_line = pred_line.reset_index().melt(id_vars="업종", var_name="연도", value_name="값")
             pred_line["출처"] = f"예측({method_for_line})"
 
         line_df = pd.concat([actual_long, pred_line], ignore_index=True)
-        # 연도 순서 보장
         year_order = TRAIN_YEARS + [y for y in FORECAST_YEARS if y not in TRAIN_YEARS]
-        line_df["연도"] = line_df["연도"].astype(str)  # Altair O-ordinal
+        line_df["연도"] = line_df["연도"].astype(str)
         line_df["연도"] = pd.Categorical(line_df["연도"], categories=[str(y) for y in year_order], ordered=True)
 
         sel2 = alt.selection_point(fields=["업종"], bind="legend")
