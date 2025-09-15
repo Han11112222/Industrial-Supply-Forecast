@@ -52,16 +52,15 @@ def read_excel_to_long(file) -> pd.DataFrame:
     """엑셀을 ‘업종, 연도, 사용량’ Long 형태로 변환. 4자리 연도 헤더만 감지(견고화)."""
     df = pd.read_excel(file, engine="openpyxl")
 
-    # 1) 연도열 탐지 (헤더 문자열에 19xx/20xx 포함)
+    # 1) 연도열 탐지
     year_cols = [c for c in df.columns if re.search(r'(?:19|20)\d{2}', str(c))]
-
-    # 2) 업종(범주) 열 선택: 연도열이 아닌 것들 중 첫 번째(가능하면 object dtype)
+    # 2) 업종(범주) 열 선택
     non_year_cols = [c for c in df.columns if c not in year_cols]
     obj_non_year = [c for c in non_year_cols if df[c].dtype == "object"]
     cat_col = obj_non_year[0] if obj_non_year else (non_year_cols[0] if non_year_cols else df.columns[0])
-    cat_col = str(cat_col)  # melt에 안전
+    cat_col = str(cat_col)
 
-    # 3) 연도열이 전혀 없으면 숫자형 열을 연도 후보로 사용
+    # 3) 연도열이 없으면 숫자형 열을 후보로
     if not year_cols:
         year_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c != cat_col]
 
@@ -168,6 +167,7 @@ if run:
     # ── 업종별 다년 예측 ─────────────────────────────────────
     result_df = pv.copy()
     result_df.columns = [f"{c} 실적" for c in result_df.columns]
+
     for industry, row in pv.iterrows():
         y = row.values.astype(float).tolist()
         x = TRAIN_YEARS
@@ -192,14 +192,20 @@ if run:
         fallback_cols = [c for c in result_df.columns if c.endswith(f"({FORECAST_YEARS[-1]})")]
         sort_col = fallback_cols[0] if fallback_cols else result_df.columns[-1]
     final_sorted = result_df.sort_values(by=sort_col, ascending=False)
+    final_sorted.index.name = "업종"  # 인덱스 이름 고정(그래프 변환 시 안전)
 
-    # 총합 행(모든 열 직접 합산) — KeyError 방지
+    # 총합 행(모든 열 직접 합산)
     totals_series = final_sorted.sum(axis=0, numeric_only=True)
     totals = {col: float(totals_series.get(col, 0.0)) for col in final_sorted.columns}
     total_row = pd.DataFrame([totals], index=["총합"])
     final_sorted_with_total = pd.concat([final_sorted, total_row], axis=0)
 
     # 표시용
+    def fmt_int_with_comma(x):
+        if pd.isna(x): return ""
+        try: return f"{int(round(float(x))):,}"
+        except Exception: return x
+
     display_df = final_sorted_with_total.copy()
     display_df.insert(0, "업종", display_df.index)
     for c in display_df.columns[1:]:
@@ -228,7 +234,6 @@ if run:
     line = alt.Chart(tot_actual).mark_line(size=3).encode(
         x="연도:O", y=alt.Y("합계:Q", axis=alt.Axis(format=","))
     )
-
     st.subheader("연도별 총합 그래프 (실적 라인 + 예측 포인트)")
     if not pts_df.empty:
         pts = alt.Chart(pts_df).mark_point(size=150, filled=True).encode(
@@ -249,37 +254,44 @@ if run:
     yy_pick = st.radio("막대그래프 기준 예측연도", FORECAST_YEARS, index=len(FORECAST_YEARS)-1, horizontal=True)
 
     method_cols_for_plot = [f"{m}({yy_pick})" for m in methods if f"{m}({yy_pick})" in final_sorted.columns]
-    pred_long = final_sorted.loc[top10_inds, method_cols_for_plot].reset_index().melt(
-        id_vars="index", var_name="방법연도", value_name="예측"
-    ).rename(columns={"index": "업종"})
-    pred_long["방법"] = pred_long["방법연도"].str.replace(r"\(\d{4}\)$", "", regex=True)
 
-    method_sel = alt.selection_point(fields=["방법"], bind="legend")
-    bars = alt.Chart(pred_long).mark_bar().encode(
-        x=alt.X("업종:N", sort=top10_inds, title=None),
-        xOffset=alt.XOffset("방법:N"),
-        y=alt.Y("예측:Q", axis=alt.Axis(format=","), title=f"{yy_pick} 예측"),
-        color=alt.Color("방법:N", legend=alt.Legend(title="방법")),
-        opacity=alt.condition(method_sel, alt.value(1.0), alt.value(0.25)),
-        tooltip=[alt.Tooltip("업종:N"), alt.Tooltip("방법:N"), alt.Tooltip("예측:Q", format=",")]
-    ).add_params(method_sel).properties(height=420)
-    bar_txt = bars.mark_text(dy=-5, fontSize=10).encode(text=alt.Text("예측:Q", format=","))
+    if method_cols_for_plot:
+        df_bar_base = final_sorted.loc[top10_inds, method_cols_for_plot].copy()
+        df_bar_base.index.name = "업종"
+        df_bar_base = df_bar_base.reset_index()
 
-    actual_long = pv.loc[top10_inds, TRAIN_YEARS].reset_index().melt(
-        id_vars="업종", var_name="연도", value_name="사용량"
-    )
-    ind_sel = alt.selection_point(fields=["업종"], bind="legend")
-    lines = alt.Chart(actual_long).mark_line(point=True, strokeWidth=3).encode(
-        x=alt.X("연도:O", title=None),
-        y=alt.Y("사용량:Q", axis=alt.Axis(format=",")),
-        color=alt.Color("업종:N", sort=top10_inds, legend=alt.Legend(title="업종(클릭으로 강조)")),
-        opacity=alt.condition(ind_sel, alt.value(1.0), alt.value(0.25)),
-        tooltip=[alt.Tooltip("업종:N"), alt.Tooltip("연도:O"), alt.Tooltip("사용량:Q", format=",")]
-    ).add_params(ind_sel).properties(height=420)
+        # melt 시 id_vars 이름을 '업종'으로 사용 → 인덱스 이름과 일치
+        pred_long = df_bar_base.melt(id_vars="업종", var_name="방법연도", value_name="예측")
+        pred_long["방법"] = pred_long["방법연도"].str.replace(r"\(\d{4}\)$", "", regex=True)
 
-    c1, c2 = st.columns(2)
-    with c1: st.altair_chart((bars + bar_txt).interactive(), use_container_width=True, theme="streamlit")
-    with c2: st.altair_chart(lines.interactive(), use_container_width=True, theme="streamlit")
+        method_sel = alt.selection_point(fields=["방법"], bind="legend")
+        bars = alt.Chart(pred_long).mark_bar().encode(
+            x=alt.X("업종:N", sort=top10_inds, title=None),
+            xOffset=alt.XOffset("방법:N"),
+            y=alt.Y("예측:Q", axis=alt.Axis(format=","), title=f"{yy_pick} 예측"),
+            color=alt.Color("방법:N", legend=alt.Legend(title="방법")),
+            opacity=alt.condition(method_sel, alt.value(1.0), alt.value(0.25)),
+            tooltip=[alt.Tooltip("업종:N"), alt.Tooltip("방법:N"), alt.Tooltip("예측:Q", format=",")]
+        ).add_params(method_sel).properties(height=420)
+        bar_txt = bars.mark_text(dy=-5, fontSize=10).encode(text=alt.Text("예측:Q", format=","))
+
+        actual_long = pv.loc[top10_inds, TRAIN_YEARS].reset_index().melt(
+            id_vars="업종", var_name="연도", value_name="사용량"
+        )
+        ind_sel = alt.selection_point(fields=["업종"], bind="legend")
+        lines = alt.Chart(actual_long).mark_line(point=True, strokeWidth=3).encode(
+            x=alt.X("연도:O", title=None),
+            y=alt.Y("사용량:Q", axis=alt.Axis(format=",")),
+            color=alt.Color("업종:N", sort=top10_inds, legend=alt.Legend(title="업종(클릭으로 강조)")),
+            opacity=alt.condition(ind_sel, alt.value(1.0), alt.value(0.25)),
+            tooltip=[alt.Tooltip("업종:N"), alt.Tooltip("연도:O"), alt.Tooltip("사용량:Q", format=",")]
+        ).add_params(ind_sel).properties(height=420)
+
+        c1, c2 = st.columns(2)
+        with c1: st.altair_chart((bars + bar_txt).interactive(), use_container_width=True, theme="streamlit")
+        with c2: st.altair_chart(lines.interactive(), use_container_width=True, theme="streamlit")
+    else:
+        st.info(f"선택한 연도 {yy_pick}에 대한 예측 열이 없어 막대 그래프를 건너뛰었어.")
 
     # ───────────────── 다운로드 (다중 시트 + 차트 포함) ─────────────────
     st.subheader("다운로드")
