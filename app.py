@@ -1,9 +1,8 @@
-# app.py — 도시가스 산업용 업종별 예측
-# • 좌측: 학습 연도 선택(멀티), 예측 구간(연·월) 입력
-# • 학습: 선택한 연도만 사용해 3가지 방법(OLS/CAGR/Holt)으로 예측
-# • 표시/다운로드: 예측 구간의 ‘종료 연도’를 예측 연도로 사용
-# • 그래프: 총합(실적+종료연도 포인트), Top10 동적 막대/라인
-# • 엑셀: 시트1 전체표, 시트2~4 각 방법(표+Top20 막대+총합 라인)
+# app.py — 도시가스 산업용 업종별 예측 (연도 범위 예측 · 다년 표시)
+# • 좌측: 학습 연도(멀티), 예측 구간(시작연~종료연) — 월 제거
+# • 학습: 선택 연도만 사용해 3가지 방법(OLS/CAGR/Holt)으로 다년 예측
+# • 표/그래프: 예측연도 전부(예: 2026, 2027)를 표시
+# • 엑셀: 시트1 전체표(모든 예측연도 열), 시트2~4 각 방법(표+Top20 막대+총합 라인)
 
 from pathlib import Path
 from io import BytesIO
@@ -22,11 +21,13 @@ from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.chart import BarChart, Reference, LineChart
 
+import altair as alt
+
 st.set_page_config(page_title="도시가스 공급량·판매량 예측 (업종별)", layout="wide")
 st.title("도시가스 공급량·판매량 예측 (업종별)")
 st.caption("RAW 엑셀 업로드 → 학습연도 선택 → 추세 예측(3종) → 정렬/총합/그래프/다운로드")
 
-# ───────────────── 사이드바: 파일/방법/버튼 ─────────────────
+# ───────────────── 사이드바: 파일/방법 ─────────────────
 with st.sidebar:
     st.header("① 데이터 불러오기")
     up = st.file_uploader("원본 엑셀 업로드 (.xlsx)", type=["xlsx"])
@@ -74,26 +75,36 @@ def read_excel_to_long(file) -> pd.DataFrame:
     m = m.dropna(subset=["업종", "사용량"])
     return m[["업종", "연도", "사용량"]]
 
-def _linear_forecast(x, y, target):
-    coef = np.polyfit(x, y, 1)
-    return np.polyval(coef, target), np.polyval(coef, x)
+def _linear_forecast(x_years, y_vals, targets):
+    coef = np.polyfit(x_years, y_vals, 1)
+    fitted = np.polyval(coef, x_years)
+    preds = [float(np.polyval(coef, t)) for t in targets]
+    return preds, fitted
 
-def _cagr_forecast(x, y, target):
-    y_start, y_end = float(y[0]), float(y[-1]); n = int(x[-1] - x[0])
+def _cagr_forecast(x_years, y_vals, targets):
+    y_start, y_end = float(y_vals[0]), float(y_vals[-1]); n = int(x_years[-1] - x_years[0])
     if y_start <= 0 or y_end <= 0 or n <= 0:
-        yh, fit = _linear_forecast(x, y, target); return yh, np.array(y)
+        return _linear_forecast(x_years, y_vals, targets)
     g = (y_end / y_start) ** (1.0 / n) - 1.0
-    # Δ연도 = target - 마지막 학습연도
-    return y_end * (1.0 + g) ** (target - x[-1]), np.array(y)
+    last = x_years[-1]
+    preds = [float(y_end * (1.0 + g) ** (t - last)) for t in targets]
+    return preds, np.array(y_vals, dtype=float)
 
-def _holt_forecast(y, steps=1):
-    if Holt is None: return None, None
+def _holt_forecast(y_vals, last_train_year, targets):
+    """Holt로 다년 예측. targets는 오름차순 가정. 실패/비정상 시 OLS로 대체."""
+    x_years = list(range(last_train_year - len(y_vals) + 1, last_train_year + 1))
+    # Holt는 미래(step>=1)만 예측 가능하므로, 과거/동년이 섞이면 OLS 대체
+    if Holt is None or len(y_vals) < 2 or any(t <= last_train_year for t in targets):
+        return _linear_forecast(x_years, y_vals, targets)
     try:
-        model = Holt(np.asarray(y), exponential=False, damped_trend=False, initialization_method="estimated")
+        model = Holt(np.asarray(y_vals), exponential=False, damped_trend=False, initialization_method="estimated")
         fit = model.fit(optimized=True)
-        return float(fit.forecast(steps)[-1]), np.array(fit.fittedvalues)
+        max_h = max(t - last_train_year for t in targets)
+        fc = fit.forecast(max_h)  # 1-step부터
+        preds = [float(fc[h - 1]) for h in [t - last_train_year for t in targets]]
+        return preds, np.array(fit.fittedvalues, dtype=float)
     except Exception:
-        return None, None
+        return _linear_forecast(x_years, y_vals, targets)
 
 def fmt_int_with_comma(x):
     if pd.isna(x): return ""
@@ -109,9 +120,7 @@ elif use_sample and sample_path.exists():
     df_long_for_ui = read_excel_to_long(sample_path)
 
 TRAIN_YEARS = None
-TARGET_YEAR = None
-meta_months = {}
-
+FORECAST_YEARS = []
 if df_long_for_ui is not None:
     all_years_sorted = sorted(df_long_for_ui["연도"].unique().tolist())
     default_train = all_years_sorted[-5:] if len(all_years_sorted) >= 5 else all_years_sorted
@@ -125,37 +134,30 @@ if df_long_for_ui is not None:
         TRAIN_YEARS = sorted(TRAIN_YEARS)
 
         st.divider()
-        st.header("④ 예측 설정")
-        # 예측 구간(연·월). 월은 표기/메타 정보로만 사용(연단위 데이터).
-        # 선택 범위(연)는 학습 가능 범위를 벗어나도 되도록 여유롭게 제공
-        future_years = list(range(all_years_sorted[-1], all_years_sorted[-1] + 6))
+        st.header("④ 예측 설정 (연도만)")
+        future_years = list(range(all_years_sorted[-1], all_years_sorted[-1] + 10))
         yr_options = sorted(set(all_years_sorted + future_years))
-
         start_year = st.selectbox("예측 시작(연)", yr_options, index=yr_options.index(all_years_sorted[-1]))
-        start_month = st.selectbox("예측 시작(월)", list(range(1, 13)), index=0)
-        end_year = st.selectbox("예측 종료(연)", yr_options, index=yr_options.index(all_years_sorted[-1]))
-        end_month = st.selectbox("예측 종료(월)", list(range(1, 13)), index=11)
-
+        end_year   = st.selectbox("예측 종료(연)", yr_options, index=min(len(yr_options)-1, yr_options.index(all_years_sorted[-1])+1))
         if end_year < start_year:
             st.warning("예측 종료(연)는 예측 시작(연)보다 크거나 같아야 합니다.")
-        TARGET_YEAR = max(start_year, end_year)  # 표시/다운로드에 사용할 예측 연도
-        meta_months = {"start_year": start_year, "start_month": start_month,
-                       "end_year": end_year, "end_month": end_month}
+        FORECAST_YEARS = list(range(min(start_year, end_year), max(start_year, end_year) + 1))
 
         st.divider()
         run = st.button("예측 시작")
-
 else:
     run = False
     st.info("좌측에서 엑셀 업로드 또는 ‘Repo 내 파일 사용’을 선택하세요.")
 
 if run:
     if df_long_for_ui is None:
-        st.error("데이터를 먼저 불러오세요.")
-        st.stop()
+        st.error("데이터를 먼저 불러오세요."); st.stop()
     if not TRAIN_YEARS:
-        st.error("학습 연도를 선택하세요.")
-        st.stop()
+        st.error("학습 연도를 선택하세요."); st.stop()
+    if not methods:
+        st.error("예측 방법을 1개 이상 선택하세요."); st.stop()
+    if not FORECAST_YEARS:
+        st.error("예측 연도를 설정하세요."); st.stop()
 
     # 실제 사용 데이터
     df_long = df_long_for_ui.copy()
@@ -165,61 +167,56 @@ if run:
         for k, v in METHOD_DESC.items():
             st.markdown(f"**{k}** — {v}")
 
-    if not methods:
-        st.warning("최소 1개 이상의 예측 방법을 선택해 주세요.")
-        st.stop()
-
     # 피벗(학습 연도만 사용)
     pv_all = df_long.pivot_table(index="업종", columns="연도", values="사용량", aggfunc="sum")
-    # 학습 연도만 포함
     missing = [y for y in TRAIN_YEARS if y not in pv_all.columns]
     if missing:
-        st.error(f"선택한 학습 연도에 데이터가 없습니다: {missing}")
-        st.stop()
+        st.error(f"선택한 학습 연도에 데이터가 없습니다: {missing}"); st.stop()
     pv = pv_all.reindex(columns=TRAIN_YEARS).fillna(0)
 
-    # ── 업종별 예측 (TARGET_YEAR 기준) ──
-    out_rows, fit_store = [], {}
+    # ── 업종별 다년 예측 ─────────────────────────────────────
+    # 결과 테이블: 실제열 + 각 방법×연도 예측열(예: '선형추세(OLS)(2026)')
+    result_df = pv.copy()
+    result_df.columns = [f"{c} 실적" for c in result_df.columns]
+
+    # fitted 저장(옵션)
+    fit_store = {}  # (industry, method) -> (x_years, fitted_values)
+
     for industry, row in pv.iterrows():
-        y = row.values.astype(float).tolist(); x = TRAIN_YEARS
+        y = row.values.astype(float).tolist()
+        x = TRAIN_YEARS
+        last_train = x[-1]
+
         for m in methods:
             if m == "선형추세(OLS)":
-                yh, fitted = _linear_forecast(x, y, TARGET_YEAR)
-                out_rows.append([industry, m, yh]); fit_store[(industry, m)] = (x, fitted)
+                preds, fitted = _linear_forecast(x, y, FORECAST_YEARS)
             elif m == "CAGR":
-                yh, fitted = _cagr_forecast(x, y, TARGET_YEAR)
-                out_rows.append([industry, m, yh]); fit_store[(industry, m)] = (x, fitted if fitted is not None else np.array(y))
+                preds, fitted = _cagr_forecast(x, y, FORECAST_YEARS)
             elif m == "Holt(지수평활)":
-                yh, fitted = _holt_forecast(y, steps=1)
-                name = m if yh is not None else "Holt(지수평활,대체:선형)"
-                if yh is None: yh, fitted = _linear_forecast(x, y, TARGET_YEAR)
-                out_rows.append([industry, name, yh]); fit_store[(industry, name)] = (x, fitted if fitted is not None else np.array(y))
+                preds, fitted = _holt_forecast(y, last_train, FORECAST_YEARS)
+            else:
+                continue
 
-    forecast_df = pd.DataFrame(out_rows, columns=["업종", "방법", f"{TARGET_YEAR} 예측"])
-    wide = forecast_df.pivot_table(index="업종", columns="방법", values=f"{TARGET_YEAR} 예측", aggfunc="first")
+            fit_store[(industry, m)] = (x, fitted)
+            for yy, pred in zip(FORECAST_YEARS, preds):
+                col = f"{m}({yy})"
+                if col not in result_df.columns:
+                    result_df[col] = np.nan
+                result_df.loc[industry, col] = pred
 
-    # ── 최종표(숫자형) + 정렬 + 총합 ──
-    final_numeric = pv.copy(); final_numeric.columns = [f"{c} 실적" for c in final_numeric.columns]
-    final_numeric = final_numeric.join(wide)
+    # 정렬 기준: 첫 번째로 선택한 방법의 "종료연도" 예측열
+    sort_method = methods[0]
+    sort_col = f"{sort_method}({FORECAST_YEARS[-1]})"
+    if sort_col not in result_df.columns:
+        # 예외적으로 다른 방법의 종료연도 열 사용
+        fallback_cols = [c for c in result_df.columns if c.endswith(f"({FORECAST_YEARS[-1]})")]
+        sort_col = fallback_cols[0] if fallback_cols else result_df.columns[-1]
 
-    # 정렬 기준
-    holt_col = next((c for c in wide.columns if c.startswith("Holt")), None)
-    sort_pref = []
-    if "선형추세(OLS)" in wide.columns: sort_pref.append("선형추세(OLS)")
-    if "CAGR" in wide.columns:          sort_pref.append("CAGR")
-    if holt_col:                         sort_pref.append(holt_col)
-    cand = [m for m in methods if m in sort_pref or (m == "Holt(지수평활)" and holt_col)]
-    sort_col = cand[0] if cand else (holt_col or (sort_pref[0] if sort_pref else None))
-    if sort_col == "Holt(지수평활)": sort_col = holt_col
+    final_sorted = result_df.sort_values(by=sort_col, ascending=False)
 
-    if sort_col is None:
-        st.error("정렬 기준으로 사용할 예측 열이 없습니다.")
-        st.stop()
-
-    final_sorted = final_numeric.sort_values(by=sort_col, ascending=False)
-
-    totals = {f"{y} 실적": pv[y].sum() for y in TRAIN_YEARS}
-    for col in wide.columns: totals[col] = wide[col].sum()
+    # 총합 행 계산(실적 + 모든 예측열)
+    totals = {col: (pv[col.replace(" 실적", "")].sum() if col.endswith("실적") else final_sorted[col].sum())
+              for col in final_sorted.columns}
     total_row = pd.DataFrame([totals], index=["총합"])
     final_sorted_with_total = pd.concat([final_sorted, total_row], axis=0)
 
@@ -229,16 +226,23 @@ if run:
     for c in display_df.columns[1:]:
         display_df[c] = display_df[c].apply(fmt_int_with_comma)
 
-    st.subheader(f"업종별 예측 표 — 학습연도 {TRAIN_YEARS[0]}–{TRAIN_YEARS[-1]} / 예측연도 {TARGET_YEAR} "
-                 f"({meta_months['start_year']}.{meta_months['start_month']:02d} ~ {meta_months['end_year']}.{meta_months['end_month']:02d})")
+    st.subheader(
+        f"업종별 예측 표 — 학습연도 {TRAIN_YEARS[0]}–{TRAIN_YEARS[-1]} / 예측연도 {FORECAST_YEARS[0]}–{FORECAST_YEARS[-1]}"
+    )
     st.dataframe(display_df.reset_index(drop=True), use_container_width=True)
 
-    # ───────────────── 그래프 ─────────────────
-    import altair as alt
-
-    st.subheader("연도별 총합 그래프 (실적 + 예측 포인트)")
+    # ───────────────── 그래프: 연도별 총합(실적 + 예측 포인트) ─────────────────
     tot_actual = pv.sum(axis=0).reset_index()
     tot_actual.columns = ["연도", "합계"]
+
+    # 모든 예측 포인트(방법×연도)
+    pts_rows = []
+    for m in methods:
+        for yy in FORECAST_YEARS:
+            col = f"{m}({yy})"
+            if col in final_sorted.columns:
+                pts_rows.append({"연도": yy, "방법": m, "값": float(final_sorted[col].sum())})
+    pts_df = pd.DataFrame(pts_rows)
 
     area = alt.Chart(tot_actual).mark_area(opacity=0.25).encode(
         x=alt.X("연도:O", title="연도"),
@@ -248,47 +252,42 @@ if run:
     line = alt.Chart(tot_actual).mark_line(size=3).encode(
         x="연도:O", y=alt.Y("합계:Q", axis=alt.Axis(format=","))
     )
-    methods_cols = list(wide.columns)
-    pts_df = pd.DataFrame({
-        "연도": [TARGET_YEAR] * len(methods_cols),
-        "방법": methods_cols,
-        "값":   [wide[c].sum() for c in methods_cols],
-    })
     pts = alt.Chart(pts_df).mark_point(size=150, filled=True).encode(
-        x="연도:O", y=alt.Y("값:Q", axis=alt.Axis(format=",")),
+        x="연도:O",
+        y=alt.Y("값:Q", axis=alt.Axis(format=",")),
         color=alt.Color("방법:N", legend=alt.Legend(title="방법")),
-        tooltip=[alt.Tooltip("방법:N"), alt.Tooltip("값:Q", format=",")]
+        shape=alt.Shape("방법:N"),
+        tooltip=[alt.Tooltip("방법:N"), alt.Tooltip("연도:O"), alt.Tooltip("값:Q", format=",")]
     )
     labels = pts.mark_text(dy=-12, fontWeight="bold").encode(text=alt.Text("값:Q", format=","))
 
+    st.subheader("연도별 총합 그래프 (실적 라인 + 예측 포인트)")
     st.altair_chart((area + line + pts + labels).interactive(), use_container_width=True, theme="streamlit")
 
-    # Top-10 동적 그래프
+    # ───────────────── Top-10: 예측 비교(막대) + 실적 추이(라인) ─────────────────
     st.markdown("### 상위 10개 업종 — 예측 비교 / 실적 추이")
     top10_inds = final_sorted.head(10).index.tolist()
 
-    method_cols_for_plot = []
-    if "선형추세(OLS)" in wide.columns: method_cols_for_plot.append("선형추세(OLS)")
-    if "CAGR"          in wide.columns: method_cols_for_plot.append("CAGR")
-    holt_real = next((c for c in wide.columns if c.startswith("Holt")), None)
-    if holt_real: method_cols_for_plot.append(holt_real)
+    # 예측연도 선택(막대 그래프 전환)
+    yy_pick = st.radio("막대그래프 기준 예측연도", FORECAST_YEARS, index=len(FORECAST_YEARS)-1, horizontal=True)
 
-    # (A) 예측 비교 (그룹형 막대)
-    pred_long = wide.loc[top10_inds, method_cols_for_plot].reset_index().melt(
-        id_vars="업종", var_name="방법", value_name="예측"
-    )
+    method_cols_for_plot = [f"{m}({yy_pick})" for m in methods if f"{m}({yy_pick})" in final_sorted.columns]
+    pred_long = final_sorted.loc[top10_inds, method_cols_for_plot].reset_index().melt(
+        id_vars="index", var_name="방법연도", value_name="예측"
+    ).rename(columns={"index": "업종"})
+    pred_long["방법"] = pred_long["방법연도"].str.replace(r"\(\d{4}\)$", "", regex=True)
+
     method_sel = alt.selection_point(fields=["방법"], bind="legend")
     bars = alt.Chart(pred_long).mark_bar().encode(
         x=alt.X("업종:N", sort=top10_inds, title=None),
         xOffset=alt.XOffset("방법:N"),
-        y=alt.Y("예측:Q", axis=alt.Axis(format=","), title=f"{TARGET_YEAR} 예측"),
+        y=alt.Y("예측:Q", axis=alt.Axis(format=","), title=f"{yy_pick} 예측"),
         color=alt.Color("방법:N", legend=alt.Legend(title="방법")),
         opacity=alt.condition(method_sel, alt.value(1.0), alt.value(0.25)),
         tooltip=[alt.Tooltip("업종:N"), alt.Tooltip("방법:N"), alt.Tooltip("예측:Q", format=",")]
     ).add_params(method_sel).properties(height=420)
     bar_txt = bars.mark_text(dy=-5, fontSize=10).encode(text=alt.Text("예측:Q", format=","))
 
-    # (B) 실적 추이 (멀티라인)
     actual_long = pv.loc[top10_inds, TRAIN_YEARS].reset_index().melt(
         id_vars="업종", var_name="연도", value_name="사용량"
     )
@@ -311,74 +310,83 @@ if run:
     out_all = final_sorted_with_total.copy()
     out_all.insert(0, "업종", out_all.index)
 
-    # 파일명에 예측 구간(연·월) 반영
-    fname_suffix = f"{meta_months['start_year']}.{meta_months['start_month']:02d}-{meta_months['end_year']}.{meta_months['end_month']:02d}"
+    # 파일명에 예측 구간(연) 반영
+    fname_suffix = f"{FORECAST_YEARS[0]}-{FORECAST_YEARS[-1]}"
 
     wb = Workbook(); wb.remove(wb.active)
+
     # 시트 1: 전체
     ws_all = wb.create_sheet("전체")
     for r in dataframe_to_rows(out_all, index=False, header=True):
         ws_all.append(r)
 
     # 각 방법별 시트 (표 + Top20 Bar + Totals Line)
-    def _add_method_sheet(method_label: str, pred_col_name: str):
+    def _add_method_sheet(method_label: str):
         ws = wb.create_sheet(method_label)
+        # 표 구성: 실적 + 해당 방법의 모든 예측연도 열
         dfm = pv.copy(); dfm.columns = [f"{c} 실적" for c in dfm.columns]
-        if pred_col_name not in wide.columns:
-            holt_real2 = next((c for c in wide.columns if c.startswith("Holt")), None)
-            use_col = holt_real2 if holt_real2 else pred_col_name
-        else:
-            use_col = pred_col_name
-        dfm[use_col] = wide[use_col]
-        dfm = dfm.sort_values(by=use_col, ascending=False).reset_index().rename(columns={"업종": "업종"})
+        pred_cols = [f"{method_label}({yy})" for yy in FORECAST_YEARS if f"{method_label}({yy})" in final_sorted.columns]
+        for col in pred_cols:
+            dfm[col] = final_sorted[col]
+        dfm = dfm.sort_values(by=(pred_cols[-1] if pred_cols else dfm.columns[-1]), ascending=False).reset_index().rename(columns={"업종": "업종"})
+
         for r in dataframe_to_rows(dfm, index=False, header=True):
             ws.append(r)
 
-        # Top20 Bar
-        topN = min(20, len(dfm))
-        start_col = dfm.shape[1] + 2
-        ws.cell(row=1, column=start_col, value="업종")
-        ws.cell(row=1, column=start_col + 1, value=f"{TARGET_YEAR} 예측")
-        for i in range(topN):
-            ws.cell(row=i + 2, column=start_col, value=dfm.loc[i, "업종"])
-            ws.cell(row=i + 2, column=start_col + 1, value=float(dfm.loc[i, use_col] or 0))
-        bar = BarChart(); bar.title = f"Top-20 {TARGET_YEAR} 예측"
-        data = Reference(ws, min_col=start_col + 1, min_row=1, max_row=topN + 1)
-        cats = Reference(ws, min_col=start_col,     min_row=2, max_row=topN + 1)
-        bar.add_data(data, titles_from_data=True); bar.set_categories(cats)
-        bar.y_axis.number_format = '#,##0'
-        ws.add_chart(bar, ws.cell(row=2, column=start_col + 3).coordinate)
+        # Top20 Bar (기본: 종료연도)
+        if pred_cols:
+            topN = min(20, len(dfm))
+            chart_year = FORECAST_YEARS[-1]
+            use_col = f"{method_label}({chart_year})"
+            start_col = dfm.shape[1] + 2
+            ws.cell(row=1, column=start_col, value="업종")
+            ws.cell(row=1, column=start_col + 1, value=f"{chart_year} 예측")
+            for i in range(topN):
+                ws.cell(row=i + 2, column=start_col, value=dfm.loc[i, "업종"])
+                ws.cell(row=i + 2, column=start_col + 1, value=float(dfm.loc[i, use_col] or 0))
+            bar = BarChart(); bar.title = f"Top-20 {chart_year} ({method_label})"
+            data = Reference(ws, min_col=start_col + 1, min_row=1, max_row=topN + 1)
+            cats = Reference(ws, min_col=start_col,     min_row=2, max_row=topN + 1)
+            bar.add_data(data, titles_from_data=True); bar.set_categories(cats)
+            bar.y_axis.number_format = '#,##0'
+            ws.add_chart(bar, ws.cell(row=2, column=start_col + 3).coordinate)
 
-        # 연도별 총합 Line
-        line_anchor_col = start_col + 6
+        # 연도별 총합 Line (실적 + 이 방법의 모든 예측연도 합계)
+        line_anchor_col = (dfm.shape[1] + 8)
         ws.cell(row=1, column=line_anchor_col,     value="연도")
         ws.cell(row=1, column=line_anchor_col + 1, value="총합")
+        # 실적 총합
         for i, y in enumerate(TRAIN_YEARS, start=2):
             ws.cell(row=i, column=line_anchor_col,     value=y)
             ws.cell(row=i, column=line_anchor_col + 1, value=float(pv[y].sum()))
-        ws.cell(row=len(TRAIN_YEARS) + 2, column=line_anchor_col,     value=TARGET_YEAR)
-        ws.cell(row=len(TRAIN_YEARS) + 2, column=line_anchor_col + 1, value=float(wide[use_col].sum()))
-        lchart = LineChart(); lchart.title = "연도별 총합(실적 + 예측)"
-        d = Reference(ws, min_col=line_anchor_col + 1, min_row=1, max_row=len(TRAIN_YEARS) + 2)
-        c = Reference(ws, min_col=line_anchor_col,     min_row=2, max_row=len(TRAIN_YEARS) + 2)
+        # 예측 총합(해당 방법)
+        base = len(TRAIN_YEARS) + 2
+        for j, yy in enumerate(FORECAST_YEARS):
+            ws.cell(row=base + j, column=line_anchor_col,     value=yy)
+            colname = f"{method_label}({yy})"
+            tot_val = float(final_sorted[colname].sum()) if colname in final_sorted.columns else 0.0
+            ws.cell(row=base + j, column=line_anchor_col + 1, value=tot_val)
+
+        lchart = LineChart(); lchart.title = f"연도별 총합(실적 + 예측, {method_label})"
+        max_row = base + len(FORECAST_YEARS) - 1
+        d = Reference(ws, min_col=line_anchor_col + 1, min_row=1, max_row=max_row)
+        c = Reference(ws, min_col=line_anchor_col,     min_row=2, max_row=max_row)
         lchart.add_data(d, titles_from_data=True); lchart.set_categories(c)
         lchart.y_axis.number_format = '#,##0'
         ws.add_chart(lchart, ws.cell(row=2, column=line_anchor_col + 3).coordinate)
 
-    _add_method_sheet("선형추세(OLS)", "선형추세(OLS)")
-    _add_method_sheet("CAGR", "CAGR")
-    holt_real = next((c for c in wide.columns if c.startswith("Holt")), None)
-    _add_method_sheet("Holt(지수평활)", holt_real if holt_real else "Holt(지수평활)")
+    for m in methods:
+        _add_method_sheet(m)
 
     bio = BytesIO(); wb.save(bio)
-    st.download_button("엑셀(xlsx) 다운로드 (다중 시트+차트 포함)",
+    st.download_button("엑셀(xlsx) 다운로드 (모든 예측연도 포함)",
                        bio.getvalue(),
-                       file_name=f"industry_forecast_{TARGET_YEAR}_{fname_suffix}.xlsx",
+                       file_name=f"industry_forecast_{fname_suffix}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     st.download_button(
-        "업종별 예측표 CSV 다운로드",
+        "업종별 예측표 CSV 다운로드 (모든 예측연도 포함)",
         out_all.to_csv(index=False).encode("utf-8-sig"),
-        file_name=f"industry_forecast_{TARGET_YEAR}_{fname_suffix}.csv",
+        file_name=f"industry_forecast_{fname_suffix}.csv",
         mime="text/csv"
     )
