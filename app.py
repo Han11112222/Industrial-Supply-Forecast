@@ -1,4 +1,4 @@
-# app.py — 도시가스 산업용 업종별 2026 예측 (동적 Top10 그래프 추가)
+# app.py — 도시가스 산업용 업종별 2026 예측 (토글 제거, 동적 Top10 그래프 유지)
 from pathlib import Path
 from io import BytesIO
 import numpy as np
@@ -49,6 +49,7 @@ def read_excel_to_long(file) -> pd.DataFrame:
     obj_cols = [c for c in df.columns if df[c].dtype == "object"]
     cat_col = obj_cols[0] if obj_cols else df.columns[0]
 
+    # 연도 헤더 자동 인식
     year_cols, year_map = [], {}
     for c in df.columns:
         s = str(c)
@@ -197,26 +198,21 @@ if df_long is not None:
 
     st.altair_chart((area + line + pts + labels).interactive(), use_container_width=True, theme="streamlit")
 
-    # ── NEW: 상위 10개 업종 동적 그래프 (예측 비교 + 실적 추이) ──
+    # ── 상위 10개 업종 동적 그래프 (예측 비교 + 실적 추이) ──
     st.markdown("### 상위 10개 업종 — 2026 예측 비교 (동적)")
     top10_inds = final_sorted.head(10).index.tolist()
 
-    # 방법 열 정리(실제 wide에 존재하는 열만)
     method_cols_for_plot = []
     if "선형추세(OLS)" in wide.columns: method_cols_for_plot.append("선형추세(OLS)")
     if "CAGR" in wide.columns:          method_cols_for_plot.append("CAGR")
     holt_real = next((c for c in wide.columns if c.startswith("Holt")), None)
     if holt_real: method_cols_for_plot.append(holt_real)
 
-    # 길게 변환 (업종, 방법, 예측)
     pred_long = wide.loc[top10_inds, method_cols_for_plot].reset_index().melt(
         id_vars="업종", var_name="방법", value_name="예측"
     )
 
-    # 동적: 범례 클릭 필터 + Hover 강조 + 줌/팬
     method_sel = alt.selection_point(fields=["방법"], bind="legend")
-    hover = alt.selection_point(on="mouseover", fields=["업종"], nearest=True, empty="none")
-
     bars = alt.Chart(pred_long).mark_bar().encode(
         x=alt.X("업종:N", sort=top10_inds, title=None),
         xOffset=alt.XOffset("방법:N"),
@@ -225,10 +221,7 @@ if df_long is not None:
         opacity=alt.condition(method_sel, alt.value(1.0), alt.value(0.25)),
         tooltip=[alt.Tooltip("업종:N"), alt.Tooltip("방법:N"), alt.Tooltip("예측:Q", format=",")]
     ).add_params(method_sel).properties(height=420)
-
-    bar_txt = bars.mark_text(dy=-5, angle=0, fontSize=10).encode(
-        text=alt.Text("예측:Q", format=",")
-    )
+    bar_txt = bars.mark_text(dy=-5, fontSize=10).encode(text=alt.Text("예측:Q", format=","))
 
     st.altair_chart((bars + bar_txt).interactive(), use_container_width=True, theme="streamlit")
 
@@ -237,7 +230,6 @@ if df_long is not None:
         id_vars="업종", var_name="연도", value_name="사용량"
     )
     ind_sel = alt.selection_point(fields=["업종"], bind="legend")
-
     lines = alt.Chart(actual_long).mark_line(point=True, strokeWidth=3).encode(
         x=alt.X("연도:O", title=None),
         y=alt.Y("사용량:Q", axis=alt.Axis(format=",")),
@@ -245,34 +237,14 @@ if df_long is not None:
         opacity=alt.condition(ind_sel, alt.value(1.0), alt.value(0.25)),
         tooltip=[alt.Tooltip("업종:N"), alt.Tooltip("연도:O"), alt.Tooltip("사용량:Q", format=",")]
     ).add_params(ind_sel).properties(height=420)
-
     st.altair_chart(lines.interactive(), use_container_width=True, theme="streamlit")
-
-    # ── 상세 그래프 토글(기존) ──
-    show_details = st.toggle("상세 그래프 보기 (히트맵/Top-N 커스텀)", value=False)
-    if show_details:
-        import altair as alt
-        st.markdown("### 업종×연도 히트맵 (실적 2021–2025)")
-        topN_hm = st.slider("히트맵 표출 업종 수(실적 합 기준)", min_value=10, max_value=min(100, len(pv)), value=min(30, len(pv)))
-        top_inds = pv.sum(axis=1).sort_values(ascending=False).head(topN_hm).index
-        heat_df = pv.loc[top_inds, YEARS].reset_index().melt(id_vars="업종", var_name="연도", value_name="사용량")
-        heat = alt.Chart(heat_df).mark_rect().encode(
-            x=alt.X("연도:O", title=None),
-            y=alt.Y("업종:N", sort="-x", title=None),
-            color=alt.Color("사용량:Q", scale=alt.Scale(scheme="blues"), legend=alt.Legend(format=",")),
-            tooltip=[alt.Tooltip("업종:N"), alt.Tooltip("연도:O"), alt.Tooltip("사용량:Q", format=",")]
-        )
-        st.altair_chart(heat, use_container_width=True, theme="streamlit")
 
     # ───────────────── 다운로드 (다중 시트 + 차트 포함) ─────────────────
     st.subheader("다운로드")
-
     out_all = final_sorted_with_total.copy()
     out_all.insert(0, "업종", out_all.index)
 
-    wb = Workbook()
-    wb.remove(wb.active)
-
+    wb = Workbook(); wb.remove(wb.active)
     # 시트 1: 전체
     ws_all = wb.create_sheet("전체")
     for r in dataframe_to_rows(out_all, index=False, header=True):
@@ -281,18 +253,14 @@ if df_long is not None:
     # 각 방법별 시트 (표 + Top20 Bar + Totals Line)
     def _add_method_sheet(method_label: str, pred_col_name: str):
         ws = wb.create_sheet(method_label)
-
-        dfm = pv.copy()
-        dfm.columns = [f"{c} 실적" for c in dfm.columns]
+        dfm = pv.copy(); dfm.columns = [f"{c} 실적" for c in dfm.columns]
         if pred_col_name not in wide.columns:
             holt_real = next((c for c in wide.columns if c.startswith("Holt")), None)
             use_col = holt_real if holt_real else pred_col_name
         else:
             use_col = pred_col_name
-
         dfm[use_col] = wide[use_col]
         dfm = dfm.sort_values(by=use_col, ascending=False).reset_index().rename(columns={"업종": "업종"})
-
         for r in dataframe_to_rows(dfm, index=False, header=True):
             ws.append(r)
 
