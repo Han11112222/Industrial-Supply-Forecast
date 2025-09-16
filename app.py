@@ -1,12 +1,12 @@
 # app.py — 산업용 공급량 예측(추세분석)
 # • 데이터: 연도별 엑셀 여러 개 업로드(또는 Repo의 산업용_*.xlsx 자동 로딩)
 # • 전처리: '상품명' == '산업용'(정확일치)만 사용, 집계는 '업종' 기준 '판매량' 합계 → (업종, 연도, 사용량)
-# • 월→연: 2025년이 8월까지만 있으면 2020-01~2025-마지막월 월시계열로 9~12월 추정해 2025 연간 보정
+# • 월→연: 2025년이 8월까지만 있으면 2020-01~마지막월 월시계열로 9~12월 추정해 2025 연간(㎥) 보정
 # • 좌측: 학습 연도(멀티, 기본 2020 포함), 예측 구간(연단위)
 # • 예측: OLS / CAGR / Holt / SES — 다년 예측
 # • 유지: session_state 저장(라디오/선택 변경에도 유지)
 # • 그래프/표/툴팁/축: 단위 (㎥) 표기
-# • 다운로드: 전체표 + 방법별 시트(Top-20 막대, 연도별 총합 라인)
+# • 다운로드: 전체표 + 방법별 시트(Top-20 막대, 연도별 총합 라인). 시트명 금지문자 제거
 
 from pathlib import Path
 from io import BytesIO
@@ -33,15 +33,22 @@ st.set_page_config(page_title="산업용 공급량 예측(추세분석)", layout
 st.title("🏭📈 산업용 공급량 예측(추세분석)")
 st.caption("여러 연도 파일 → ‘산업용’만 필터 → 업종·연도 집계 → 4가지 추세 예측(월 보정 포함) — **단위: ㎥**")
 
-with st.expander("예측 방법 설명", expanded=False):
+with st.expander("📘 예측 방법 설명 (쉬운 설명 + 산식)", expanded=False):
     st.markdown(
         """
-- **선형추세(OLS)**: `y_t = a + b t`, 예측 `ŷ_{T+h} = a + b (T+h)`
-- **CAGR(복리)**: `g = (y_T/y_0)^{1/n} - 1`, 예측 `ŷ_{T+h} = y_T (1+g)^h`
-- **Holt(지수평활·추세형)**: `ŷ_{T+h} = l_T + h b_T` (계절성 제외)
-- **SES(지수평활)**: `ŷ_{T+h} = l_T` (추세·계절성 제외)
+**선형추세(OLS)** — 해마다 늘어나는 폭을 직선으로 잡아 앞으로 그린다.  
+산식: `y_t = a + b t`, 예측 `ŷ_{T+h} = a + b (T+h)`
 
-*2025년 월데이터가 8월까지만 있을 때는 2020-01~마지막월 월시계열로 **9~12월**을 추정해 2025 **연간(㎥)**을 보정합니다.*
+**CAGR(복리성장)** — 시작~끝 사이의 평균 복리 성장률만큼 매년 같은 비율로 늘린다.  
+산식: `g = (y_T / y_0)^{1/n} - 1`, 예측 `ŷ_{T+h} = y_T (1+g)^h`
+
+**Holt(지수평활·추세형)** — 수준과 추세를 지수 가중으로 갱신해 최근 흐름을 더 반영한다(계절성 제외).  
+산식(개략): `l_t = α y_t + (1-α)(l_{t-1}+b_{t-1})`, `b_t = β(l_t - l_{t-1}) + (1-β)b_{t-1}`, 예측 `ŷ_{T+h} = l_T + h b_T`
+
+**지수평활(SES)** — 최근 관측치에 더 큰 가중을 둔 평균으로 미래를 예측한다(추세·계절성 제외).  
+산식: `l_t = α y_t + (1-α) l_{t-1}`, 예측 `ŷ_{T+h} = l_T`
+
+> ※ 2025년 월데이터가 8월까지만 있으면 2020-01~마지막월 월시계열로 **9–12월**을 예측해 2025 **연간(㎥)** 을 보정한다.
 """
     )
 
@@ -72,7 +79,6 @@ def _extract_year_from_filename(name: str) -> int | None:
     return None
 
 def _parse_ym(s: pd.Series) -> pd.Series:
-    """판매년월(예: Jan-25 / 2025-01 등) → pandas Period('M')"""
     x = s.astype(str).str.strip()
     d = pd.to_datetime(x, errors="coerce", infer_datetime_format=True)
     if d.isna().all():
@@ -87,6 +93,12 @@ def _safe_sum(x):
         return float(np.nansum(x))
     except Exception:
         return 0.0
+
+def _safe_sheet_name(name: str) -> str:
+    """엑셀 시트명 금지문자 제거 및 31자 제한."""
+    bad = r'[:\\/?*\[\]]'
+    name = re.sub(bad, "_", name)
+    return name[:31] if len(name) > 31 else name
 
 @st.cache_data(show_spinner=False)
 def load_monthly(files, repo_use: bool) -> pd.DataFrame:
@@ -255,9 +267,6 @@ if pv_all.empty:
     st.warning("선택한 업종분류에 데이터가 없습니다.")
     st.stop()
 
-min_y, max_y = int(pv_all.columns.min()), int(pv_all.columns.max())
-latest_y = max_y
-
 # ───────────────────────── 학습/예측 기간 ─────────────────────────
 TRAIN_YEARS = []
 FORECAST_YEARS = []
@@ -319,7 +328,6 @@ def compute_and_store():
                     result[col] = np.nan
                 result.loc[ind, col] = p
 
-    # 정렬 기준
     sort_method = methods[0]
     sort_col = f"{sort_method}({FORECAST_YEARS[-1]})(㎥)"
     if sort_col not in result.columns:
@@ -344,7 +352,6 @@ if run_clicked and methods and TRAIN_YEARS and FORECAST_YEARS:
 
 # ② 업종분류 라디오 변경 시 즉시 재계산(이미 한 번 계산된 상태라면)
 if st.session_state.started and sel_cat != st.session_state.last_cat:
-    # 카테고리 변경에 맞춰 새 피벗 재생성 후 즉시 재계산
     pv_all = build_pivot_for_category(sel_cat)
     if not pv_all.empty and methods and TRAIN_YEARS and FORECAST_YEARS:
         compute_and_store()
@@ -469,13 +476,14 @@ if st.session_state.started:
     fname = f"industry_forecast_{FORECAST_YEARS[0]}-{FORECAST_YEARS[-1]}.xlsx"
 
     wb = Workbook(); wb.remove(wb.active)
-    # 시트1: 전체
-    ws_all = wb.create_sheet("전체(단위:㎥)")
+
+    # 시트1: 전체 (시트명 안전화)
+    ws_all = wb.create_sheet(_safe_sheet_name("전체(단위_㎥)"))
     for r in dataframe_to_rows(out_all, index=False, header=True): ws_all.append(r)
 
     # 방법별 시트
     def add_method_sheet(mth):
-        ws = wb.create_sheet(mth)
+        ws = wb.create_sheet(_safe_sheet_name(mth))
         dfm = pv.copy(); dfm.columns = [f"{c} 실적(㎥)" for c in dfm.columns]
         pred_cols = [f"{mth}({yy})(㎥)" for yy in FORECAST_YEARS if f"{mth}({yy})(㎥)" in final_sorted.columns]
         for c in pred_cols: dfm[c] = final_sorted[c]
