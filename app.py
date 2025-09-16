@@ -1,7 +1,7 @@
 # app.py — 산업용 공급량 예측(추세분석)
 # • 데이터: 연도별 엑셀 여러 개 업로드(또는 Repo의 산업용_*.xlsx 자동 로딩)
-# • 전처리: '상품명' == '산업용' (정확일치)만 사용, 집계는 '업종' 기준으로 '판매량' 합계 → (업종, 연도, 사용량)
-# • 좌측: 학습 연도(멀티), 예측 구간(시작연~종료연, 월 제외)
+# • 전처리: '상품명' == '산업용' (정확일치)만 사용, 집계는 '업종' 기준으로 '판매량' 합계 → (업종분류, 업종, 연도, 사용량)
+# • 좌측: 학습 연도(멀티, 2020~선택 단추), 예측 구간(시작연~종료연)
 # • 예측: OLS / CAGR / Holt / SES — 다년 예측
 # • 결과 유지: session_state 저장(라디오/선택 변경에도 유지)
 # • 그래프: 총합(실적+예측포인트), Top-10 막대(연도 선택), Top-10 실적추이(예측연도 연장)
@@ -30,7 +30,7 @@ from openpyxl.chart import BarChart, Reference, LineChart
 # ───────────────────────── 기본 UI ─────────────────────────
 st.set_page_config(page_title="산업용 공급량 예측(추세분석)", layout="wide")
 st.title("🏭📈 산업용 공급량 예측(추세분석)")
-st.caption("연도별 엑셀 업로드(여러 개) 또는 Repo 일괄 로딩 → ‘산업용’만 필터 → 업종별·연도별 판매량 집계 → 4가지 추세 예측")
+st.caption("연도별 엑셀 업로드(여러 개) 또는 Repo 일괄 로딩 → ‘산업용’만 필터 → 업종분류/업종·연도별 판매량 집계 → 4가지 추세 예측")
 
 # 방법 설명(쉬운 설명 + 산식)
 st.markdown(
@@ -40,9 +40,9 @@ st.markdown(
   산식: 직선 `y_t = a + b t`, 예측 `ŷ_{T+h} = a + b (T+h)`
 - **CAGR(복리성장)** *(Compound Annual Growth Rate)* — 시작~끝 사이의 평균 복리 성장률로 늘린다.  
   산식: `g = (y_T / y_0)^{1/n} - 1`, 예측 `ŷ_{T+h} = y_T (1+g)^h`
-- **Holt(지수평활·추세형)** — 수준 `l_t`와 추세 `b_t`를 지수 가중으로 갱신해 최근 흐름을 더 반영한다(계절성 제외).  
+- **Holt(지수평활·추세형)** — 수준/추세를 지수 가중으로 갱신(계절성 제외).  
   산식(개략): `l_t = α y_t + (1-α)(l_{t-1}+b_{t-1})`, `b_t = β(l_t - l_{t-1}) + (1-β)b_{t-1}`, 예측 `ŷ_{T+h} = l_T + h b_T`
-- **지수평활(SES)** *(Simple Exponential Smoothing)* — 최근 관측치를 더 크게 반영한 평균으로 미래를 예측한다(추세·계절성 제외).  
+- **지수평활(SES)** *(Simple Exponential Smoothing)* — 최근 관측치에 가중을 더 줘 미래 수준을 예측(추세 없음).  
   산식: `l_t = α y_t + (1-α) l_{t-1}`, 예측 `ŷ_{T+h} = l_T`
 """
 )
@@ -82,10 +82,9 @@ def _parse_year_series(s: pd.Series) -> pd.Series:
     x = s.astype(str).str.strip()
     y = pd.to_datetime(x, errors="coerce", infer_datetime_format=True)
     if y.isna().all():
-        # 영문월-2자리연도 패턴 시도 (Jan-25 등)
-        y = pd.to_datetime(x, format="%b-%y", errors="coerce")
+        y = pd.to_datetime(x, format="%b-%y", errors="coerce")  # 영문월-2자리연도
     out = y.dt.year.astype("Int64")
-    # 2자리 연도로만 적힌 경우 보정(예: '25' → 2025)
+    # 2자리 연도만 있는 경우
     mask_2 = out.isna() & x.str.fullmatch(r"\d{2}")
     out.loc[mask_2] = 2000 + x.loc[mask_2].astype(int)
     # 4자리 숫자만 있는 경우
@@ -97,85 +96,131 @@ def _coerce_num(s):
     return pd.to_numeric(s, errors="coerce")
 
 @st.cache_data(show_spinner=False)
-def load_and_prepare(files, repo_use: bool):
+def load_and_prepare(files, repo_use: bool) -> pd.DataFrame:
     """
-    여러 엑셀을 읽어 ‘산업용’만 필터하고 (업종, 연도, 사용량) Long 형태 반환.
+    여러 엑셀을 읽어 ‘산업용’만 필터하고 (업종분류, 업종, 연도, 사용량) Long 형태 반환.
     파일 내에 연도가 없을 땐 파일명에서 연도 추출.
     """
     targets: list[tuple[str, BytesIO | Path]] = []
-    # 업로드 우선, 없으면 Repo 사용
     if files:
-        for f in files:
-            targets.append((f.name, f))
+        for f in files: targets.append((f.name, f))
     elif repo_use:
         for p in sorted([p for p in Path(".").glob("산업용_*.xlsx")]):
             targets.append((p.name, p))
 
     if not targets:
-        return pd.DataFrame(columns=["업종","연도","사용량"])
+        return pd.DataFrame(columns=["업종분류","업종","연도","사용량"])
 
     frames = []
     for name, src in targets:
-        # 엑셀 로드
         df = pd.read_excel(src, engine="openpyxl")
-        # 컬럼 표준화(공백 제거)
         df.columns = [_clean_col(c) for c in df.columns]
 
-        # === 필수 컬럼을 '정확히' 지정: 상품명, 업종, 판매량 ===
-        if "상품명" not in df.columns or "업종" not in df.columns or "판매량" not in df.columns:
-            # 요구 스펙과 다른 파일은 건너뜀
+        # 필수 컬럼: 정확히 존재해야 함
+        if not all(c in df.columns for c in ["상품명","업종","판매량"]):
             continue
 
-        col_item = "상품명"
-        col_ind  = "업종"
-        col_qty  = "판매량"
-        col_ym   = None
+        col_item = "상품명"; col_ind = "업종"; col_qty = "판매량"
+        col_group = "업종분류" if "업종분류" in df.columns else None
+        col_ym = None
         for c in ("판매년월","년월","월","연도","년도"):
             if c in df.columns:
-                col_ym = c
-                break
+                col_ym = c; break
 
-        # ① ‘산업용’ 행만 필터 — 정확일치 (공백 제거 후 비교)
+        # ① ‘산업용’ 정확일치 필터
         item_norm = df[col_item].astype(str).str.replace(r"\s+","", regex=True)
         mask_industry = item_norm == "산업용"
-        d = df.loc[mask_industry, [col_ind, col_qty] + ([col_ym] if col_ym else [])].copy()
+        use_cols = [col_ind, col_qty] + ([col_group] if col_group else []) + ([col_ym] if col_ym else [])
+        d = df.loc[mask_industry, use_cols].copy()
 
         # ② 수치화
         d[col_qty] = _coerce_num(d[col_qty])
 
-        # ③ 연도 만들기 (판매년월 → 연도), 실패 시 파일명에서 추출
+        # ③ 연도 생성
         if col_ym:
             yy = _parse_year_series(d[col_ym])
         else:
             yy = pd.Series([pd.NA]*len(d), dtype="Int64")
-
         if yy.isna().all():
             fn_year = _extract_year_from_filename(name)
             if fn_year is not None:
                 yy = pd.Series([fn_year]*len(d), dtype="Int64")
-
         d["연도"] = yy.astype("Int64")
 
         # ④ 정리
-        d = d.rename(columns={col_ind:"업종", col_qty:"사용량"})
+        if col_group is None:
+            d["업종분류"] = "미지정"
+        else:
+            d.rename(columns={col_group:"업종분류"}, inplace=True)
+        d.rename(columns={col_ind:"업종", col_qty:"사용량"}, inplace=True)
         d = d.dropna(subset=["업종","사용량","연도"])
         d["연도"] = d["연도"].astype(int)
-        frames.append(d[["업종","연도","사용량"]])
+        frames.append(d[["업종분류","업종","연도","사용량"]])
 
     if not frames:
-        return pd.DataFrame(columns=["업종","연도","사용량"])
+        return pd.DataFrame(columns=["업종분류","업종","연도","사용량"])
 
     longdf = pd.concat(frames, ignore_index=True)
 
-    # ⑤ 업종·연도별 합계(연도 중복 존재 시 월 합산)
+    # ⑤ 업종분류·업종·연도별 합계(연도 중복 시 월 합산)
     agg = (
-        longdf
-        .groupby(["업종","연도"], as_index=False)["사용량"]
-        .sum()
-        .sort_values(["연도","사용량"], ascending=[True, False])
+        longdf.groupby(["업종분류","업종","연도"], as_index=False)["사용량"]
+              .sum()
+              .sort_values(["연도","사용량"], ascending=[True, False])
     )
     return agg
 
+# ───────────────────────── 데이터 준비 ─────────────────────────
+df_long_all = load_and_prepare(ups, use_repo)
+
+if df_long_all.empty:
+    st.info("좌측에서 연도별 엑셀을 올리거나 ‘Repo 파일 자동 읽기’를 켜줘.")
+else:
+    yr_min, yr_max = df_long_all["연도"].min(), df_long_all["연도"].max()
+    st.success(f"로드 완료: 업종 {df_long_all['업종'].nunique():,}개, 업종분류 {df_long_all['업종분류'].nunique():,}종, 연도 범위 {yr_min}–{yr_max} · 지표: 판매량")
+
+# 업종분류 선택(메인영역, 표 위에 노출되도록 여기서 표시)
+cat_options = ["전체"] + (sorted(df_long_all["업종분류"].dropna().unique().tolist()) if not df_long_all.empty else [])
+cat_pick = st.radio("업종분류 선택", cat_options, index=0, horizontal=True, key="cat_pick")
+
+# UI: 학습/예측 기간(사이드바)
+TRAIN_YEARS = []
+FORECAST_YEARS = []
+run_clicked = False
+if not df_long_all.empty:
+    years_all = sorted(df_long_all["연도"].unique().tolist())
+    default_2020 = [y for y in years_all if y >= 2020] or years_all  # 2020 포함 기본
+    with st.sidebar:
+        st.divider()
+        st.header("🗓️ ③ 학습/예측 기간")
+        c1, c2 = st.columns(2)
+        if c1.button("2020~선택", use_container_width=True):
+            st.session_state["train_years"] = default_2020
+        if c2.button("전체해제", use_container_width=True):
+            st.session_state["train_years"] = []
+
+        TRAIN_YEARS = st.multiselect(
+            "학습 연도",
+            years_all,
+            default=st.session_state.get("train_years", default_2020),
+            key="train_years"
+        )
+        TRAIN_YEARS = sorted(TRAIN_YEARS) if TRAIN_YEARS else []
+
+        future = list(range(years_all[-1], years_all[-1] + 10))
+        yr_opts = sorted(set(years_all + future))
+        start_y = st.selectbox("예측 시작(연)", yr_opts, index=yr_opts.index(years_all[-1]))
+        end_y   = st.selectbox("예측 종료(연)", yr_opts, index=min(len(yr_opts)-1, yr_opts.index(years_all[-1])+3))  # 기본 3년 확장
+        FORECAST_YEARS = list(range(min(start_y, end_y), max(start_y, end_y) + 1))
+
+        st.divider()
+        run_clicked = st.button("🚀 예측 시작", use_container_width=True)
+
+# ───────────────────────── 상태 유지(세션) ─────────────────────────
+if "started" not in st.session_state:
+    st.session_state.started = False
+if "store" not in st.session_state:
+    st.session_state.store = {}
 
 def _ols(x_years, y_vals, targets):
     coef = np.polyfit(x_years, y_vals, 1)
@@ -218,46 +263,19 @@ def fmt_int(x):
     try: return f"{int(round(float(x))):,}"
     except Exception: return x
 
-
-# ───────────────────────── 데이터 준비 ─────────────────────────
-df_long_ui = load_and_prepare(ups, use_repo)
-
-if df_long_ui.empty:
-    st.info("좌측에서 연도별 엑셀을 올리거나 ‘Repo 파일 자동 읽기’를 켜줘.")
-else:
-    st.success(f"로드 완료: 업종 {df_long_ui['업종'].nunique():,}개, 연도 범위 {df_long_ui['연도'].min()}–{df_long_ui['연도'].max()}")
-
-# UI: 학습/예측 기간
-TRAIN_YEARS = []
-FORECAST_YEARS = []
-run_clicked = False
-if not df_long_ui.empty:
-    years = sorted(df_long_ui["연도"].unique().tolist())
-    default_train = years[-5:] if len(years) >= 5 else years
-
-    with st.sidebar:
-        st.divider()
-        st.header("🗓️ ③ 학습/예측 기간")
-        TRAIN_YEARS = st.multiselect("학습 연도", years, default=default_train)
-        TRAIN_YEARS = sorted(TRAIN_YEARS) if TRAIN_YEARS else []
-        future = list(range(years[-1], years[-1] + 10))
-        yr_opts = sorted(set(years + future))
-        start_y = st.selectbox("예측 시작(연)", yr_opts, index=yr_opts.index(years[-1]))
-        end_y   = st.selectbox("예측 종료(연)", yr_opts, index=min(len(yr_opts)-1, yr_opts.index(years[-1])+1))
-        FORECAST_YEARS = list(range(min(start_y, end_y), max(start_y, end_y) + 1))
-
-        st.divider()
-        run_clicked = st.button("🚀 예측 시작", use_container_width=True)
-
-# ───────────────────────── 상태 유지(세션) ─────────────────────────
-if "started" not in st.session_state:
-    st.session_state.started = False
-if "store" not in st.session_state:
-    st.session_state.store = {}
-
 def compute_and_store():
+    # 업종분류 필터 적용
+    if cat_pick == "전체":
+        df_use = df_long_all.copy()
+    else:
+        df_use = df_long_all.loc[df_long_all["업종분류"] == cat_pick].copy()
+
+    if df_use.empty:
+        st.warning("선택한 업종분류에 해당하는 데이터가 없습니다.")
+        st.stop()
+
     # 업종 x 연도 피벗(실적)
-    pv_all = df_long_ui.pivot_table(index="업종", columns="연도", values="사용량", aggfunc="sum").fillna(0)
+    pv_all = df_use.pivot_table(index="업종", columns="연도", values="사용량", aggfunc="sum").fillna(0)
 
     missing = [y for y in TRAIN_YEARS if y not in pv_all.columns]
     if missing:
@@ -307,11 +325,12 @@ def compute_and_store():
 
     st.session_state.store = dict(
         pv=pv, final=final_sorted, final_total=final_with_total,
-        train_years=TRAIN_YEARS, fc_years=FORECAST_YEARS, methods=methods
+        train_years=TRAIN_YEARS, fc_years=FORECAST_YEARS, methods=methods,
+        cat_pick=cat_pick
     )
     st.session_state.started = True
 
-if run_clicked and not df_long_ui.empty and methods and TRAIN_YEARS and FORECAST_YEARS:
+if run_clicked and not df_long_all.empty and methods and TRAIN_YEARS and FORECAST_YEARS:
     compute_and_store()
 
 # ───────────────────────── 결과 표시 ─────────────────────────
@@ -322,14 +341,17 @@ if st.session_state.started:
     TRAIN_YEARS  = st.session_state.store["train_years"]
     FORECAST_YEARS = st.session_state.store["fc_years"]
     methods = st.session_state.store["methods"]
+    cat_pick = st.session_state.store["cat_pick"]
 
-    st.success(f"업종 {pv.shape[0]}개, 학습 {TRAIN_YEARS[0]}–{TRAIN_YEARS[-1]}, 예측 {FORECAST_YEARS[0]}–{FORECAST_YEARS[-1]}")
+    cat_text = "전체" if cat_pick == "전체" else f"{cat_pick}"
+    st.success(f"[업종분류: {cat_text}] 업종 {pv.shape[0]}개, 학습 {TRAIN_YEARS[0]}–{TRAIN_YEARS[-1]}, 예측 {FORECAST_YEARS[0]}–{FORECAST_YEARS[-1]}")
 
     # 표
     st.subheader("🧾 업종별 예측 표")
     disp = final_total.copy()
     disp.insert(0, "업종", disp.index)
-    for c in disp.columns[1:]: disp[c] = disp[c].apply(fmt_int)
+    for c in disp.columns[1:]:
+        disp[c] = disp[c].apply(fmt_int)
     st.dataframe(disp.reset_index(drop=True), use_container_width=True)
 
     # 총합 그래프 (실적+예측 포인트)
@@ -385,7 +407,7 @@ if st.session_state.started:
         ).add_params(sel).properties(height=420)
         bar_txt = bars.mark_text(dy=-5, fontSize=10).encode(text=alt.Text("예측:Q", format=","))
 
-        st.markdown("※ 라인 그래프는 **첫 번째로 선택한 방법**으로 2026·2027을 이어서 보여줘.")
+        st.markdown("※ 라인 그래프는 **첫 번째로 선택한 방법**으로 예측 연도를 이어서 보여줘.")
         method_for_line = methods[0]
         pred_cols_for_line = [f"{method_for_line}({yy})" for yy in FORECAST_YEARS if f"{method_for_line}({yy})" in final_sorted.columns]
 
@@ -395,7 +417,8 @@ if st.session_state.started:
         pred_line = pd.DataFrame()
         if pred_cols_for_line:
             pred_line = final_sorted.loc[top10, pred_cols_for_line].copy()
-            pred_line.columns = [int(re.search(r"\((\d{4})\)", c).group(1)) for c in pred_line.columns]
+            import re as _re
+            pred_line.columns = [int(_re.search(r"\((\d{4})\)", c).group(1)) for c in pred_line.columns]
             pred_line = pred_line.reset_index().melt(id_vars="업종", var_name="연도", value_name="값")
             pred_line["출처"] = f"예측({method_for_line})"
 
@@ -414,10 +437,8 @@ if st.session_state.started:
         ).add_params(sel2).properties(height=420)
 
         c1, c2 = st.columns(2)
-        with c1:
-            st.altair_chart((bars + bar_txt).interactive(), use_container_width=True, theme="streamlit")
-        with c2:
-            st.altair_chart(lines.interactive(), use_container_width=True, theme="streamlit")
+        with c1: st.altair_chart((bars + bar_txt).interactive(), use_container_width=True, theme="streamlit")
+        with c2: st.altair_chart(lines.interactive(), use_container_width=True, theme="streamlit")
     else:
         st.info(f"{yy_pick}년 예측 열이 없어서 막대그래프는 건너뛰었어.")
 
@@ -428,11 +449,9 @@ if st.session_state.started:
     fname = f"industry_forecast_{FORECAST_YEARS[0]}-{FORECAST_YEARS[-1]}.xlsx"
 
     wb = Workbook(); wb.remove(wb.active)
-    # 시트1: 전체
     ws_all = wb.create_sheet("전체")
     for r in dataframe_to_rows(out_all, index=False, header=True): ws_all.append(r)
 
-    # 방법별 시트
     def add_method_sheet(mth):
         ws = wb.create_sheet(mth)
         dfm = pv.copy(); dfm.columns = [f"{c} 실적" for c in dfm.columns]
