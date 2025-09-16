@@ -1,8 +1,10 @@
 # app.py — 산업용 공급량 예측(추세분석)
+# • 데이터: 연도별 엑셀 여러 개 업로드(또는 Repo의 산업용_*.xlsx 자동 로딩)
+# • 전처리: '상품명'에 '산업용' 포함 행만 사용, 업종 기준으로 '판매량' 집계 → (업종, 연도, 사용량)
 # • 좌측: 학습 연도(멀티), 예측 구간(시작연~종료연, 월 제외)
 # • 예측: OLS / CAGR / Holt / SES — 다년 예측
-# • 결과 유지: 예측 시작 후 session_state에 저장 → 라디오 변경에도 유지
-# • 그래프: 총합(실적+예측포인트), Top-10 막대(연도 선택), Top-10 실적추이(예측연도까지 연장)
+# • 결과 유지: session_state 저장(라디오/선택 변경에도 유지)
+# • 그래프: 총합(실적+예측포인트), Top-10 막대(연도 선택), Top-10 실적추이(예측연도 연장)
 # • 다운로드: 전체표 + 방법별 시트(Top-20 막대, 연도별 총합 라인)
 
 from pathlib import Path
@@ -25,10 +27,11 @@ from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.chart import BarChart, Reference, LineChart
 
+
 # ───────────────────────── 기본 UI ─────────────────────────
 st.set_page_config(page_title="산업용 공급량 예측(추세분석)", layout="wide")
 st.title("🏭📈 산업용 공급량 예측(추세분석)")
-st.caption("RAW 엑셀 업로드 → 학습연도 선택 → 추세 예측(4종) → 정렬/총합/그래프/다운로드")
+st.caption("연도별 엑셀 업로드(여러 개) 또는 Repo 일괄 로딩 → ‘산업용’만 필터 → 업종별·연도별 판매량 집계 → 4가지 추세 예측")
 
 # 방법 설명(쉬운 설명 + 산식)
 st.markdown(
@@ -40,7 +43,7 @@ st.markdown(
   산식: `g = (y_T / y_0)^{1/n} - 1`, 예측 `ŷ_{T+h} = y_T (1+g)^h`
 - **Holt(지수평활·추세형)** — 수준 `l_t`와 추세 `b_t`를 지수 가중으로 갱신해 최근 흐름을 더 반영한다(계절성 제외).  
   산식(개략): `l_t = α y_t + (1-α)(l_{t-1}+b_{t-1})`, `b_t = β(l_t - l_{t-1}) + (1-β)b_{t-1}`, 예측 `ŷ_{T+h} = l_T + h b_T`
-- **지수평활(SES)** *(Simple Exponential Smoothing, 신규 추가)* — 최근 관측치를 더 크게 반영한 평균으로 미래를 예측한다(추세·계절성 제외).  
+- **지수평활(SES)** *(Simple Exponential Smoothing)* — 최근 관측치를 더 크게 반영한 평균으로 미래를 예측한다(추세·계절성 제외).  
   산식: `l_t = α y_t + (1-α) l_{t-1}`, 예측 `ŷ_{T+h} = l_T`
 """
 )
@@ -48,9 +51,14 @@ st.markdown(
 # ───────────────────────── 사이드바 ─────────────────────────
 with st.sidebar:
     st.header("📥 ① 데이터 불러오기")
-    up = st.file_uploader("원본 엑셀(.xlsx)", type=["xlsx"])
-    sample_path = Path("산업용_업종별.xlsx")
-    use_sample = st.checkbox(f"Repo 파일 사용: {sample_path.name}", value=sample_path.exists())
+    ups = st.file_uploader("연도별 엑셀(.xlsx) 여러 개 업로드", type=["xlsx"], accept_multiple_files=True)
+
+    st.caption("또는, Repo에 있는 **산업용_*.xlsx** 파일을 자동으로 읽을 수 있어.")
+    repo_files = sorted([p for p in Path(".").glob("산업용_*.xlsx")])
+    use_repo = st.checkbox(f"Repo 파일 자동 읽기 ({len(repo_files)}개 감지됨)", value=bool(repo_files))
+
+    if repo_files:
+        st.write("읽을 대상:", "\n\n".join([f"- {p.name}" for p in repo_files]))
 
     st.divider()
     st.header("🧪 ② 예측 방법")
@@ -58,28 +66,117 @@ with st.sidebar:
     methods = st.multiselect("방법 선택(정렬 기준은 첫 번째)", METHOD_CHOICES, default=METHOD_CHOICES)
 
 # ───────────────────────── 유틸 ─────────────────────────
+def _clean_col(s: str) -> str:
+    return re.sub(r"\s+", "", str(s)).strip()
+
+def _extract_year_from_filename(name: str) -> int | None:
+    """산업용_YYYY.xlsx 또는 산업용_YYYYMM.xlsx에서 연도 추출"""
+    m = re.search(r"(19|20)(\d{2})(\d{2})?$", name.replace(".xlsx",""))
+    if m:
+        return int(m.group(1)+m.group(2))
+    return None
+
+def _parse_year_series(s: pd.Series) -> pd.Series:
+    """판매년월(예: Jan-25 등)에서 연도 추출. 실패 시 NA."""
+    if s is None:
+        return pd.Series([pd.NA]*0, dtype="Int64")
+    x = s.astype(str).str.strip()
+    y = pd.to_datetime(x, errors="coerce", infer_datetime_format=True)
+    if y.isna().all():
+        # 영문월-2자리연도 패턴 시도 (Jan-25 등)
+        y = pd.to_datetime(x, format="%b-%y", errors="coerce")
+    out = y.dt.year.astype("Int64")
+    # 2자리 연도로만 적힌 경우 보정(예: '25' → 2025)
+    mask_2 = out.isna() & x.str.fullmatch(r"\d{2}")
+    out.loc[mask_2] = 2000 + x.loc[mask_2].astype(int)
+    # 4자리 숫자만 있는 경우
+    mask_4 = out.isna() & x.str.fullmatch(r"(19|20)\d{2}")
+    out.loc[mask_4] = x.loc[mask_4].astype(int)
+    return out
+
+def _coerce_num(s):
+    return pd.to_numeric(s, errors="coerce")
+
 @st.cache_data(show_spinner=False)
-def read_excel_to_long(file) -> pd.DataFrame:
-    """엑셀 → Long(업종, 연도, 사용량). 4자리 연도 헤더만 인식."""
-    df = pd.read_excel(file, engine="openpyxl")
+def load_and_prepare(files, repo_use: bool):
+    """
+    여러 엑셀을 읽어 ‘산업용’만 필터하고 (업종, 연도, 사용량) Long 형태 반환.
+    파일 내에 연도가 없을 땐 파일명에서 연도 추출.
+    """
+    targets: list[tuple[str, BytesIO | Path]] = []
+    # 업로드 우선, 없으면 Repo 사용
+    if files:
+        for f in files:
+            targets.append((f.name, f))
+    elif repo_use:
+        for p in sorted([p for p in Path(".").glob("산업용_*.xlsx")]):
+            targets.append((p.name, p))
 
-    year_cols = [c for c in df.columns if re.search(r"(?:19|20)\d{2}", str(c))]
-    non_year_cols = [c for c in df.columns if c not in year_cols]
-    obj_non_year = [c for c in non_year_cols if df[c].dtype == "object"]
-    cat_col = obj_non_year[0] if obj_non_year else (non_year_cols[0] if non_year_cols else df.columns[0])
-    cat_col = str(cat_col)
+    if not targets:
+        return pd.DataFrame(columns=["업종","연도","사용량"])
 
-    if not year_cols:  # 연도머리글 없으면 숫자형 열 사용
-        year_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c != cat_col]
+    frames = []
+    for name, src in targets:
+        # 엑셀 로드
+        df = pd.read_excel(src, engine="openpyxl")
+        # 컬럼 표준화(공백 제거)
+        df.columns = [_clean_col(c) for c in df.columns]
 
-    m = df[[cat_col] + year_cols].copy().melt(id_vars=[cat_col], var_name="연도헤더", value_name="사용량")
-    years = m["연도헤더"].astype(str).str.extract(r"((?:19|20)\d{2})")[0]
-    m["연도"] = pd.to_numeric(years, errors="coerce").astype("Int64")
-    m = m.dropna(subset=["연도"]).rename(columns={cat_col: "업종"})
-    m["연도"] = m["연도"].astype(int)
-    m["사용량"] = pd.to_numeric(m["사용량"], errors="coerce")
-    m = m.dropna(subset=["업종", "사용량"])
-    return m[["업종", "연도", "사용량"]]
+        # 필수 컬럼 후보 찾기
+        cand_item = [c for c in df.columns if "상품명" in c or c.lower()=="item"]
+        cand_ind  = [c for c in df.columns if c.startswith("업종")]
+        cand_qty  = [c for c in df.columns if "판매량" in c or "사용량" in c or "수량" in c]
+        cand_ym   = [c for c in df.columns if c in ("판매년월","년월","월","연도","년도")]
+
+        if not cand_item or not cand_ind or not cand_qty:
+            # 최소한 존재해야 처리 가능
+            continue
+
+        col_item = cand_item[0]
+        col_ind  = cand_ind[0]
+        col_qty  = cand_qty[0]
+        col_ym   = cand_ym[0] if cand_ym else None
+
+        # ① ‘산업용’ 행만 필터 (상품명에 '산업용' 포함)
+        mask_industry = df[col_item].astype(str).str.contains("산업용", na=False)
+        d = df.loc[mask_industry, [col_ind, col_qty] + ([col_ym] if col_ym else [])].copy()
+
+        # ② 수치화
+        d[col_qty] = _coerce_num(d[col_qty])
+
+        # ③ 연도 만들기 (판매년월 → 연도), 실패 시 파일명에서 추출
+        if col_ym:
+            yy = _parse_year_series(d[col_ym])
+        else:
+            yy = pd.Series([pd.NA]*len(d), dtype="Int64")
+
+        if yy.isna().all():
+            fn_year = _extract_year_from_filename(name)
+            if fn_year is not None:
+                yy = pd.Series([fn_year]*len(d), dtype="Int64")
+
+        d["연도"] = yy.astype("Int64")
+
+        # ④ 정리
+        d = d.rename(columns={col_ind:"업종", col_qty:"사용량"})
+        d = d.dropna(subset=["업종","사용량","연도"])
+        d["연도"] = d["연도"].astype(int)
+        frames.append(d[["업종","연도","사용량"]])
+
+    if not frames:
+        return pd.DataFrame(columns=["업종","연도","사용량"])
+
+    longdf = pd.concat(frames, ignore_index=True)
+
+    # ⑤ 업종·연도별 합계(연도 중복 존재 시 월 합산)
+    agg = (
+        longdf
+        .groupby(["업종","연도"], as_index=False)["사용량"]
+        .sum()
+        .sort_values(["연도","사용량"], ascending=[True, False])
+    )
+    return agg
+
 
 def _ols(x_years, y_vals, targets):
     coef = np.polyfit(x_years, y_vals, 1)
@@ -122,18 +219,20 @@ def fmt_int(x):
     try: return f"{int(round(float(x))):,}"
     except Exception: return x
 
+
 # ───────────────────────── 데이터 준비 ─────────────────────────
-df_long_ui = None
-if up is not None:
-    df_long_ui = read_excel_to_long(up)
-elif use_sample and sample_path.exists():
-    df_long_ui = read_excel_to_long(sample_path)
+df_long_ui = load_and_prepare(ups, use_repo)
+
+if df_long_ui.empty:
+    st.info("좌측에서 연도별 엑셀을 올리거나 ‘Repo 파일 자동 읽기’를 켜줘.")
+else:
+    st.success(f"로드 완료: 업종 {df_long_ui['업종'].nunique():,}개, 연도 범위 {df_long_ui['연도'].min()}–{df_long_ui['연도'].max()}")
 
 # UI: 학습/예측 기간
 TRAIN_YEARS = []
 FORECAST_YEARS = []
 run_clicked = False
-if df_long_ui is not None:
+if not df_long_ui.empty:
     years = sorted(df_long_ui["연도"].unique().tolist())
     default_train = years[-5:] if len(years) >= 5 else years
 
@@ -150,8 +249,6 @@ if df_long_ui is not None:
 
         st.divider()
         run_clicked = st.button("🚀 예측 시작", use_container_width=True)
-else:
-    st.info("좌측에서 엑셀을 업로드하거나 ‘Repo 파일 사용’을 체크해줘.")
 
 # ───────────────────────── 상태 유지(세션) ─────────────────────────
 if "started" not in st.session_state:
@@ -160,15 +257,17 @@ if "store" not in st.session_state:
     st.session_state.store = {}
 
 def compute_and_store():
-    df_long = df_long_ui.copy()
-    pv_all = df_long.pivot_table(index="업종", columns="연도", values="사용량", aggfunc="sum")
+    # 업종 x 연도 피벗(실적)
+    pv_all = df_long_ui.pivot_table(index="업종", columns="연도", values="사용량", aggfunc="sum").fillna(0)
+
     missing = [y for y in TRAIN_YEARS if y not in pv_all.columns]
     if missing:
         st.error(f"학습 연도 데이터 없음: {missing}")
         st.stop()
+
     pv = pv_all.reindex(columns=TRAIN_YEARS).fillna(0)
 
-    # 예측
+    # 예측 결과 테이블의 베이스
     result = pv.copy()
     result.columns = [f"{c} 실적" for c in result.columns]
 
@@ -190,10 +289,9 @@ def compute_and_store():
                 preds, _ = _ols(x, y, FORECAST_YEARS)
 
             for yy, p in zip(FORECAST_YEARS, preds):
-                col = f"{label}({yy})" if "(" not in label.split()[-1] else f"{label}"
-                # 위 라인은 label 자체가 이미 (연도)형이 아닌 일반 라벨인 것을 가정
                 col = f"{label}({yy})"
-                if col not in result.columns: result[col] = np.nan
+                if col not in result.columns:
+                    result[col] = np.nan
                 result.loc[ind, col] = p
 
     sort_method = methods[0]
@@ -214,7 +312,7 @@ def compute_and_store():
     )
     st.session_state.started = True
 
-if run_clicked and df_long_ui is not None and methods and TRAIN_YEARS and FORECAST_YEARS:
+if run_clicked and not df_long_ui.empty and methods and TRAIN_YEARS and FORECAST_YEARS:
     compute_and_store()
 
 # ───────────────────────── 결과 표시 ─────────────────────────
@@ -226,7 +324,7 @@ if st.session_state.started:
     FORECAST_YEARS = st.session_state.store["fc_years"]
     methods = st.session_state.store["methods"]
 
-    st.success(f"로드 완료: 업종 {pv.shape[0]}개, 학습 {TRAIN_YEARS[0]}–{TRAIN_YEARS[-1]}, 예측 {FORECAST_YEARS[0]}–{FORECAST_YEARS[-1]}")
+    st.success(f"업종 {pv.shape[0]}개, 학습 {TRAIN_YEARS[0]}–{TRAIN_YEARS[-1]}, 예측 {FORECAST_YEARS[0]}–{FORECAST_YEARS[-1]}")
 
     # 표
     st.subheader("🧾 업종별 예측 표")
@@ -288,7 +386,6 @@ if st.session_state.started:
         ).add_params(sel).properties(height=420)
         bar_txt = bars.mark_text(dy=-5, fontSize=10).encode(text=alt.Text("예측:Q", format=","))
 
-        # 라인(실적 + 선택방법 예측연장: 첫 번째 방법)
         st.markdown("※ 라인 그래프는 **첫 번째로 선택한 방법**으로 2026·2027을 이어서 보여줘.")
         method_for_line = methods[0]
         pred_cols_for_line = [f"{method_for_line}({yy})" for yy in FORECAST_YEARS if f"{method_for_line}({yy})" in final_sorted.columns]
@@ -355,7 +452,8 @@ if st.session_state.started:
             ws.cell(row=1, column=sc+1, value=f"{y} 예측")
             for i in range(topN):
                 ws.cell(row=i+2, column=sc, value=dfm.loc[i, "업종"])
-                ws.cell(row=i+2, column=sc+1, value=float(dfm.loc[i, use_col] or 0))
+                v = dfm.loc[i, use_col]
+                ws.cell(row=i+2, column=sc+1, value=float(v if pd.notna(v) else 0))
             bar = BarChart(); bar.title = f"Top-20 {y} ({mth})"
             data = Reference(ws, min_col=sc+1, min_row=1, max_row=topN+1)
             cats = Reference(ws, min_col=sc,   min_row=2, max_row=topN+1)
@@ -371,6 +469,7 @@ if st.session_state.started:
             ws.cell(row=i, column=la,   value=y)
             ws.cell(row=i, column=la+1, value=float(pv[y].sum()))
         base = len(TRAIN_YEARS) + 2
+
         for j, y in enumerate(FORECAST_YEARS):
             ws.cell(row=base+j, column=la,   value=y)
             col = f"{mth}({y})"
